@@ -151,13 +151,17 @@ def read_pdf(path: Path):
 
 
 def kind_by_name(path: Path):
-    """靠文件名判断: 提单号后面还有别的东西 = B/L, 只有提单号 = Waybill"""
+    """返回 (MBL号, 类型, HBL号)
+       CHN3962684 2609A336281 -> ("CHN3962684", "bl", "2609A336281")
+       CHN3962684             -> ("CHN3962684", "wb", "")
+    """
     stem = path.stem.upper().strip()
     m = KEY_PATTERN.search(stem)
     if not m:
-        return None, None
+        return None, None, ""
     rest = (stem[:m.start()] + stem[m.end():]).strip(" _-")
-    return m.group(0), ("bl" if rest else "wb")
+    hbl = re.split(r"[\s_\-]+", rest)[0] if rest else ""
+    return m.group(0), ("bl" if rest else "wb"), hbl
 
 
 def kind_by_text(txt: str):
@@ -222,7 +226,7 @@ def main():
 
     groups, problems = {}, []
     for p in pdfs:
-        key, k_name = kind_by_name(p)
+        key, k_name, hbl = kind_by_name(p)
         npages, txt = read_pdf(p)
         k_text = kind_by_text(txt)
         if not key:
@@ -239,18 +243,24 @@ def main():
             problems.append((p.name, f"{key} 的 {kind} 重复"))
             continue
         slot[kind] = (p, npages)
+        if kind == "bl":
+            slot["hbl"] = hbl
 
     matched, singles = [], []
     for key in groups:
         s = groups[key]
         if "bl" in s and "wb" in s:
-            matched.append((key, "", s["bl"], s["wb"]))
+            h = s.get("hbl", "")
+            if not h:
+                problems.append((s["bl"][0].name, f"{key}: B/L 文件名里没找到 HBL 号,排到最后"))
+            matched.append((key, h, s["bl"], s["wb"]))
         else:
             f, _ = s.get("bl") or s["wb"]
             singles.append((key, f))
             problems.append((f.name, f"{key}: " + ("缺 Waybill" if "bl" in s else "缺 Transport B/L")))
 
-    matched.sort(key=lambda x: x[0])
+    # 按 HBL 排序; 没有 HBL 的排最后, 再按 MBL 排
+    matched.sort(key=lambda x: (x[1] == "", x[1], x[0]))
     singles.sort(key=lambda x: x[0])
 
     print(f"配对成功 {len(matched)} 票 | 落单 {len(singles)} | 问题 {len(problems)}\n")
@@ -285,7 +295,7 @@ def main():
                 note = f"Waybill 只有 {nwb} 页"
 
             rows.append({
-                "提单号": key, "批次": bi, "第几张纸": start_sheet,
+                "HBL": hbl, "MBL": key, "批次": bi, "第几张纸": start_sheet,
                 "BL文件": bl.name, "BL页数": nbl,
                 "Waybill文件": wb.name, "Waybill总页数": nwb,
                 "合计页数": total + pad, "占纸张": (total + pad) // 2, "备注": note,
