@@ -6,6 +6,7 @@
 
 流程:
   解压 zip -> 按提单号配对 -> 合并成双面打印就绪的 PDF -> 原始文件归档
+  下次再跑时, 上一批的成品 PDF 会自动挪进同一个归档文件夹, 不用手动删
 
 每票 = [Transport B/L 全部页] + [Waybill 第1页] = 2 页 = 双面打印 1 张纸
         正面 B/L, 反面 Waybill
@@ -38,9 +39,81 @@ KEY_PATTERN = re.compile(r"[A-Z]{2,4}\d{6,}")   # 提单号格式, 如 CHN396655
 WAYBILL_PAGES = [1]                             # Waybill 只打第几页
 BL_HINT = "COMBINED TRANSPORT"
 WB_HINT = "WAYBILL"
+MARKER = "_batch.txt"                           # 记录本批归档到哪个文件夹
+EXTRA_OUT = ("_需人工处理.pdf", "_报告.csv")
 # ==================================
 
 
+
+
+def writable_path(p: Path) -> Path:
+    """Windows 上文件被 Excel / Adobe 开着时无法覆盖, 会抛 PermissionError。
+       与其整个脚本崩掉, 不如换个带时间戳的名字存下来, 至少数据不丢。"""
+    try:
+        with open(p, "ab"):
+            pass
+        return p
+    except PermissionError:
+        alt = p.with_name(f"{p.stem}_{datetime.now():%H%M%S}{p.suffix}")
+        print(f"  ! {p.name} 正被其他程序占用(多半是 Excel 或 Adobe 开着)")
+        print(f"    改存为 {alt.name}")
+        return alt
+    except Exception:
+        return p
+
+
+
+
+def is_output_file(f: Path) -> bool:
+    return f.is_file() and (f.name.startswith("PRINT") or f.name in EXTRA_OUT)
+
+
+def archive_old_output(out_dir: Path, archive_root: Path):
+    """把上一批留下的成品挪走, 跟那一批的原始文件归到同一个文件夹"""
+    olds = [f for f in out_dir.iterdir() if is_output_file(f)]
+    marker = out_dir / MARKER
+
+    if not olds:
+        if marker.exists():
+            marker.unlink()
+        return
+
+    if archive_root is None:                      # 没配归档就只能删
+        for f in olds:
+            try:
+                f.unlink()
+            except Exception:
+                pass
+        print(f"清掉上一批的 {len(olds)} 个成品文件")
+        return
+
+    name = ""
+    if marker.exists():
+        try:
+            name = marker.read_text(encoding="utf-8").strip()
+        except Exception:
+            name = ""
+    if not name:                                  # 记号丢了就用文件修改时间兜底
+        name = datetime.fromtimestamp(olds[0].stat().st_mtime).strftime("%Y-%m-%d_%H%M")
+
+    dest = archive_root / name
+    dest.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for f in olds:
+        try:
+            t = dest / f.name
+            i = 1
+            while t.exists():
+                t = dest / f"{f.stem}({i}){f.suffix}"
+                i += 1
+            shutil.move(str(f), str(t))
+            moved += 1
+        except Exception as e:
+            print(f"  ! 挪不动 {f.name}: {e}")
+    print(f"上一批的 {moved} 个成品已归档 -> {name}")
+
+    if marker.exists():
+        marker.unlink()
 
 
 def unzip_all(folder: Path):
@@ -95,10 +168,34 @@ def kind_by_text(txt: str):
     return None
 
 
+def archive_sources(src: Path, archive_root: Path) -> str:
+    """把处理过的 zip 和 pdf 挪到归档文件夹, 返回文件夹名"""
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    dest = archive_root / stamp
+    dest.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    picks = [f for f in src.iterdir()
+             if f.is_file() and f.suffix.lower() in (".zip", ".pdf")]
+    for f in picks:
+        try:
+            t = dest / f.name
+            i = 1
+            while t.exists():
+                t = dest / f"{f.stem}({i}){f.suffix}"
+                i += 1
+            shutil.move(str(f), str(t))
+            moved += 1
+        except Exception as e:
+            print(f"  ! 归档失败 {f.name}: {e}")
+    print(f"已归档 {moved} 个原始文件 -> {stamp}")
+    return stamp
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("folder", help="输入文件夹 1_DROP_ZIPS_HERE")
     ap.add_argument("--out", default=None, help="输出文件夹 2_READY_TO_PRINT")
+    ap.add_argument("--archive", default=None, help="归档文件夹 3_ARCHIVE")
     ap.add_argument("--chunk", type=int, default=0, help="每个输出文件放几票, 0=不拆")
     ap.add_argument("--dry-run", action="store_true", help="只检查, 什么都不动")
     args = ap.parse_args()
@@ -108,6 +205,13 @@ def main():
         sys.exit(f"找不到输入文件夹: {src}")
     out_dir = Path(args.out) if args.out else src / "_PRINT"
     out_dir.mkdir(parents=True, exist_ok=True)
+    arc = Path(args.archive) if args.archive else None
+    if arc:
+        arc.mkdir(parents=True, exist_ok=True)
+
+    if not args.dry_run:
+        archive_old_output(out_dir, arc)
+
     unzip_all(src)
 
     pdfs = sorted(p for p in src.glob("*.pdf") if p.is_file())
@@ -189,7 +293,7 @@ def main():
 
         if writer is not None:
             name = "PRINT.pdf" if len(batches) == 1 else f"PRINT_{bi:02d}.pdf"
-            with open(out_dir / name, "wb") as fh:
+            with open(writable_path(out_dir / name), "wb") as fh:
                 writer.write(fh)
             print(f"  {name}: {len(writer.pages)} 页 = {len(writer.pages)//2} 张纸")
 
@@ -201,11 +305,11 @@ def main():
             if len(w.pages) % 2:
                 last = w.pages[-1]
                 w.add_blank_page(width=last.mediabox.width, height=last.mediabox.height)
-        with open(out_dir / "_需人工处理.pdf", "wb") as fh:
+        with open(writable_path(out_dir / "_需人工处理.pdf"), "wb") as fh:
             w.write(fh)
         print(f"  _需人工处理.pdf: {len(singles)} 个落单文件")
 
-    report_path = (out_dir / "_报告.csv")
+    report_path = writable_path(out_dir / "_报告.csv")
     with open(report_path, "w", newline="", encoding="utf-8-sig") as fh:
         if rows:
             wtr = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
@@ -219,6 +323,10 @@ def main():
 
     if args.dry_run:
         print("\n(检查模式: 没有生成 PDF, 什么文件都没动)")
+    elif arc:
+        stamp = archive_sources(src, arc)
+        # 留个记号, 下次跑的时候把这批成品挪到同一个归档文件夹
+        (out_dir / MARKER).write_text(stamp, encoding="utf-8")
 
 
 if __name__ == "__main__":

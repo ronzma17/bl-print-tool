@@ -1,0 +1,80 @@
+﻿提单打印工具  —  使用说明
+========================================
+
+【每天怎么用】
+
+1. 把邮件里下载的 zip 包,全部丢进  1_DROP_ZIPS_HERE  文件夹
+   (直接丢 zip 就行,不用自己解压;丢散装 PDF 也可以)
+
+2. 双击  START_HERE.bat
+
+3. 输入 2 按回车
+
+4. 弹出来的  2_READY_TO_PRINT  文件夹里会有 PRINT.pdf
+   (票数超过 50 会自动拆成 PRINT_01.pdf、PRINT_02.pdf ...)
+
+5. 打开 PRINT.pdf,Ctrl+P 打印,设置见下方
+
+6. 原始文件会自动挪到  3_ARCHIVE  里按日期存好,
+   1_DROP_ZIPS_HERE 会清空,明天直接丢新的进去
+
+
+【打印设置】(只需设一次,以后 Adobe 会记住)
+
+  Printer                        Brother HL-L2465DW
+  Pages to Print                 All
+  Print on both sides of paper   打勾
+                                 Flip on LONG edge   ← 一定是长边
+  Page Sizing & Handling         Shrink oversized pages
+  纸张                            Letter 8.5 x 11
+
+  * 短边翻转(short edge)会让反面上下颠倒,别选错
+  * 必须用 Letter 纸,这台机器的自动双面不支持 A4
+
+
+【出来的结果】
+
+  每张纸:正面 = Combined Transport B/L
+          反面 = Waybill 第 1 页
+  (Waybill 后面两页是条款,不打)
+
+
+【菜单里的其他选项】
+
+  1 = 只检查不生成。想先确认有没有漏件时用,原始文件不会被挪走
+  3 = 全部合成一个 PDF,不按 50 票拆分
+  0 = 打开文件夹看看
+
+
+【打完先做一件事】
+
+  抽第一张纸翻过来,核对正反面的提单号是不是同一个
+  (例如正面 CHN3962684,反面也应该是 CHN3962684)
+  对上了就放心打完整叠。
+
+
+【出问题时看这里】
+
+  ● 提示 "缺少 pypdf"
+    开始菜单搜 cmd,输入:  pip install pypdf
+
+  ● 提示 python 不是内部或外部命令
+    没装 Python。去 python.org 下载安装,
+    安装第一屏一定要勾上 "Add python.exe to PATH"
+
+  ● 2_READY_TO_PRINT 里的报告(_报告.csv)最下面有"问题清单"
+    列出配不上对的文件,比如只有 B/L 没有 Waybill。
+    这些会单独放进 _需人工处理.pdf,不会混进正常那叠。
+
+  ● 票数不对
+    报告的行数 = 票数 = 文件数的一半。
+    对不上就看问题清单。
+
+
+【文件夹说明】
+
+  1_DROP_ZIPS_HERE    收件箱,zip 丢这里
+  2_READY_TO_PRINT    成品,拿去打印
+  3_ARCHIVE           处理过的原始文件,按日期归档
+  prep_print.py       程序本体,不要动也不要双击
+  START_HERE.bat      每天双击这个
