@@ -66,6 +66,55 @@ def writable_path(p: Path) -> Path:
 
 
 
+def manifest_rows(path: Path):
+    """读舱单, 返回 {MBL: {...}}。不认列名(船公司表头会变), 靠内容判断每一列是什么。"""
+    rows = []
+    suf = path.suffix.lower()
+    try:
+        if suf == ".xls":
+            import xlrd
+            bk = xlrd.open_workbook(str(path))
+            for sh in bk.sheets():
+                for r in range(sh.nrows):
+                    rows.append([str(sh.cell_value(r, c)).strip() for c in range(sh.ncols)])
+        elif suf in (".xlsx", ".xlsm"):
+            from openpyxl import load_workbook
+            for ws in load_workbook(str(path), read_only=True, data_only=True).worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    rows.append([("" if v is None else str(v)).strip() for v in row])
+        else:
+            import csv as _csv
+            with open(path, encoding="utf-8-sig", errors="ignore") as fh:
+                rows = [r for r in _csv.reader(fh)]
+    except ImportError:
+        print(f"  ! 读不了 {path.name}: 缺少 xlrd, 请执行  pip install xlrd")
+        return {}
+    except Exception as e:
+        print(f"  ! 读不了 {path.name}: {e}")
+        return {}
+
+    SIZE = re.compile(r"(\d+)\s*[xX]\s*(\d{2}[A-Z]{2})")
+    out = {}
+    for r in rows:
+        mbl = next((v.upper() for v in r
+                    if KEY_PATTERN.fullmatch(v.upper()) and not CONTAINER_PATTERN.fullmatch(v.upper())), "")
+        if not mbl:
+            continue
+        hbl = next((v.upper() for v in r if HBL_PATTERN.search(v.upper())), "")
+        sz  = next((SIZE.search(v) for v in r if SIZE.search(v)), None)
+        pods = [v for v in r if v.isupper() and v.replace(" ", "").isalpha() and len(v) > 3]
+        out[mbl] = {
+            "HBL舱单": hbl,
+            "柜数舱单": int(sz.group(1)) if sz else "",
+            "柜型舱单": sz.group(2) if sz else "",
+            "始发港": pods[0] if len(pods) > 0 else "",
+            "目的港": pods[1] if len(pods) > 1 else "",
+            "备注": next((v for v in r if any(ch > "\u4e00" for ch in v)), ""),
+            "文件包": next((v for v in r if v.upper().startswith("PART")), ""),
+        }
+    return out
+
+
 def load_manifest(path: Path):
     """读船公司给的舱单(xls/xlsx/csv), 把里面所有 MBL 号抠出来。
        不认列名, 直接全表扫描找符合提单号格式的格子 —— 船公司的表头经常变,
@@ -106,6 +155,111 @@ def load_manifest(path: Path):
     return keys
 
 
+SCAC = "CMDU"            # MBL 前缀, 换船公司时改这里
+
+S1_FIELDS = [
+    ("MBL",      "MBL"),
+    ("HBL",      "HBL"),
+    ("柜数",     "柜数"),
+    ("柜号",     "柜号"),
+    ("封条",     "封条"),
+    ("柜型",     "柜型"),
+    ("件数",     "件数"),
+    ("重量",     "重量"),
+    ("材积",     "材积"),
+    ("运输方式", "运输方式"),
+    ("目的地",   "目的地"),
+    ("ETA",      "ETA"),
+    ("状态",     "状态"),
+    ("第几张纸", "第几张纸"),
+    ("批次",     "批次"),
+    ("文件包",   "文件包"),
+    ("备注",     "备注"),
+    ("BL文件",   "BL文件"),
+    ("Waybill文件", "Waybill文件"),
+]
+
+
+def strip_unit(v):
+    """1041CARTONS -> 1041 ; 13457.000 KGS -> 13457.000 ; 68.000CBM -> 68.000"""
+    if not v:
+        return ""
+    parts = [re.sub(r"[A-Za-z()\s]+$", "", x).strip() for x in str(v).split(",")]
+    return ",".join(p for p in parts)
+
+
+def write_s1_report(out_dir, rows, problems, man_lines):
+    """第一叠报告。xlsx 带高亮, 没装 openpyxl 就退回 csv。
+       Ramp 整行红字, 柜型不是 40HC 的那一格标橙。"""
+    headers = [h for h, _ in S1_FIELDS]
+    keys    = [k for _, k in S1_FIELDS]
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter as L
+    except ImportError:
+        print("  ! 没装 openpyxl, 报告存成 csv(无高亮)。想要高亮:  pip install openpyxl")
+        path = writable_path(out_dir / "_报告.csv")
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(headers)
+            for r in rows:
+                w.writerow([r.get(k, "") for k in keys])
+            if man_lines:
+                fh.write("\n舱单核对\n")
+                for a, b in man_lines:
+                    fh.write(f'"{a}","{b}"\n')
+            fh.write("\n问题清单\n文件,原因\n")
+            for n, why in problems:
+                fh.write(f'"{n}","{why}"\n')
+        return path
+
+    ORANGE = PatternFill("solid", fgColor="FCE4D6")
+    HEAD   = PatternFill("solid", fgColor="DDEBF7")
+    RED    = Font(color="C00000", bold=True)   # Ramp
+
+    wb = Workbook(); ws = wb.active; ws.title = "明细"
+    ws.append(headers)
+    for c in range(1, len(headers) + 1):
+        ws.cell(1, c).font = Font(bold=True); ws.cell(1, c).fill = HEAD
+
+    size_col = keys.index("柜型") + 1
+    for r in rows:
+        ws.append([("" if r.get(k) in (None,) else r.get(k)) for k in keys])
+        i = ws.max_row
+        if str(r.get("运输方式", "")).lower() == "ramp":
+            for c in range(1, len(headers) + 1):
+                ws.cell(i, c).font = RED
+        sz = str(r.get("柜型", ""))
+        if sz and any(x.strip().upper() != "40HC" for x in sz.split(",")):
+            ws.cell(i, size_col).fill = ORANGE
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{L(len(headers))}{ws.max_row}"
+    for c, (h, k) in enumerate(S1_FIELDS, 1):
+        longest = max([len(str(h))] + [len(str(x.get(k, ""))) for x in rows] or [0])
+        ws.column_dimensions[L(c)].width = min(max(longest + 2, 8), 40)
+
+    w2 = wb.create_sheet("核对与异常")
+    w2.append(["类型", "内容"])
+    for c in (1, 2):
+        w2.cell(1, c).font = Font(bold=True); w2.cell(1, c).fill = HEAD
+    for a, b in man_lines:
+        w2.append([a, b])
+    for n, why in problems:
+        w2.append([n, why])
+    w2.column_dimensions["A"].width = 34
+    w2.column_dimensions["B"].width = 60
+
+    ramp = sum(1 for r in rows if str(r.get("运输方式", "")).lower() == "ramp")
+    odd  = sum(1 for r in rows if r.get("柜型") and
+               any(x.strip().upper() != "40HC" for x in str(r["柜型"]).split(",")))
+    print(f"  Ramp(转铁路) {ramp} 票 -> 整行红字")
+    print(f"  非 40HC 柜型 {odd} 票 -> 柜型格标橙")
+
+    path = writable_path(out_dir / "_报告.xlsx")
+    wb.save(path)
+    return path
 
 
 def is_output_file(f: Path) -> bool:
@@ -324,7 +478,9 @@ def main():
         if not mp.exists():
             print(f"!! 找不到舱单: {mp}\n")
         else:
-            want = load_manifest(mp)
+            man = manifest_rows(mp)
+            man_info.update(man)
+            want = set(man) or load_manifest(mp)
             have = {k for k, _, _, _ in matched} | {k for k, _ in singles}
             lack = sorted(want - have)
             more = sorted(have - want)
@@ -349,6 +505,12 @@ def main():
                 man_lines.append(("舱单有你没有", k))
             for k in more:
                 man_lines.append(("你有舱单没有", k))
+
+    main_pod = ""
+    if man_info:
+        pods = [v.get("目的港", "") for v in man_info.values() if v.get("目的港")]
+        if pods:
+            main_pod = max(set(pods), key=pods.count)
 
     rows = []
     batches = ([matched] if args.chunk <= 0
@@ -379,11 +541,23 @@ def main():
             if nwb < max(WAYBILL_PAGES):
                 note = f"Waybill 只有 {nwb} 页"
 
+            info = man_info.get(key, {})
+            dest = info.get("目的港", "")
+            mode = ""
+            if dest:
+                mode = "Ramp" if dest != main_pod else "Port"
             rows.append({
-                "HBL": hbl, "MBL": key, "批次": bi, "第几张纸": start_sheet,
-                "BL文件": bl.name, "BL页数": nbl,
-                "Waybill文件": wb.name, "Waybill总页数": nwb,
-                "合计页数": total + pad, "占纸张": (total + pad) // 2, "备注": note,
+                "MBL": (SCAC + key) if key else "",
+                "HBL": hbl,
+                "柜数": info.get("柜数舱单", "") or "",
+                "柜号": "", "封条": "",
+                "柜型": info.get("柜型舱单", "") or "",
+                "件数": "", "重量": "", "材积": "",
+                "运输方式": mode, "目的地": dest, "ETA": "",
+                "状态": note or "正常",
+                "第几张纸": start_sheet, "批次": bi,
+                "文件包": info.get("文件包", ""), "备注": info.get("备注", ""),
+                "BL文件": bl.name, "Waybill文件": wb.name,
             })
 
         if writer is not None:
@@ -404,19 +578,7 @@ def main():
             w.write(fh)
         print(f"  _需人工处理.pdf: {len(singles)} 个落单文件")
 
-    report_path = writable_path(out_dir / "_报告.csv")
-    with open(report_path, "w", newline="", encoding="utf-8-sig") as fh:
-        if rows:
-            wtr = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-            wtr.writeheader()
-            wtr.writerows(rows)
-        if man_lines:
-            fh.write("\n舱单核对\n项目,内容\n")
-            for x, y in man_lines:
-                fh.write(f'"{x}","{y}"\n')
-        fh.write("\n问题清单\n文件,原因\n")
-        for n, why in problems:
-            fh.write(f'"{n}","{why}"\n')
+    report_path = write_s1_report(out_dir, rows, problems, man_lines)
 
     print(f"\n报告: {report_path}")
 
