@@ -44,6 +44,8 @@ EXTRA_OUT = ("_需人工处理.pdf", "_报告.csv")
 # ==================================
 
 
+CONTAINER_PATTERN = re.compile(r"\b[A-Z]{4}\d{7}\b")  # 柜号, 别当成提单号
+HBL_PATTERN = re.compile(r"\d{4}[A-Z]\d{5,8}")        # HBL, 如 2609A338346 / AIC2609A338346
 
 
 def writable_path(p: Path) -> Path:
@@ -60,6 +62,48 @@ def writable_path(p: Path) -> Path:
         return alt
     except Exception:
         return p
+
+
+
+
+def load_manifest(path: Path):
+    """读船公司给的舱单(xls/xlsx/csv), 把里面所有 MBL 号抠出来。
+       不认列名, 直接全表扫描找符合提单号格式的格子 —— 船公司的表头经常变,
+       认列名很容易哪天就挂了, 扫格子反而稳。"""
+    cells = []
+    suf = path.suffix.lower()
+    try:
+        if suf == ".xls":
+            import xlrd
+            bk = xlrd.open_workbook(str(path))
+            for sh in bk.sheets():
+                for r in range(sh.nrows):
+                    for c in range(sh.ncols):
+                        cells.append(str(sh.cell_value(r, c)))
+        elif suf in (".xlsx", ".xlsm"):
+            from openpyxl import load_workbook
+            wb = load_workbook(str(path), read_only=True, data_only=True)
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    cells.extend(str(v) for v in row if v is not None)
+        else:                                   # csv / txt
+            with open(path, encoding="utf-8-sig", errors="ignore") as fh:
+                for line in fh:
+                    cells.extend(line.replace(",", " ").split())
+    except ImportError:
+        print(f"  ! 读不了 {path.name}: 缺少 xlrd, 请执行  pip install xlrd")
+        return set()
+    except Exception as e:
+        print(f"  ! 读不了 {path.name}: {e}")
+        return set()
+
+    keys = set()
+    for v in cells:
+        for m in KEY_PATTERN.finditer(v.upper()):
+            k = m.group(0)
+            if not CONTAINER_PATTERN.fullmatch(k):
+                keys.add(k)
+    return keys
 
 
 
@@ -179,7 +223,7 @@ def archive_sources(src: Path, archive_root: Path) -> str:
     dest.mkdir(parents=True, exist_ok=True)
     moved = 0
     picks = [f for f in src.iterdir()
-             if f.is_file() and f.suffix.lower() in (".zip", ".pdf")]
+             if f.is_file() and f.suffix.lower() in (".zip", ".pdf", ".xls", ".xlsx", ".xlsm")]
     for f in picks:
         try:
             t = dest / f.name
@@ -201,6 +245,8 @@ def main():
     ap.add_argument("--out", default=None, help="输出文件夹 2_READY_TO_PRINT")
     ap.add_argument("--archive", default=None, help="归档文件夹 3_ARCHIVE")
     ap.add_argument("--chunk", type=int, default=0, help="每个输出文件放几票, 0=不拆")
+    ap.add_argument("--manifest", default=None,
+                    help="船公司舱单 xls/xlsx/csv, 跑完自动核对缺哪几票")
     ap.add_argument("--dry-run", action="store_true", help="只检查, 什么都不动")
     args = ap.parse_args()
 
@@ -265,6 +311,45 @@ def main():
 
     print(f"配对成功 {len(matched)} 票 | 落单 {len(singles)} | 问题 {len(problems)}\n")
 
+    # ---- 跟船公司舱单核对 ----
+    man_lines, man_info = [], {}
+    mp = Path(args.manifest) if args.manifest else None
+    if mp is None:                                   # 没指定就在输入文件夹里自己找
+        found = sorted(f for f in src.iterdir()
+                       if f.is_file() and f.suffix.lower() in (".xls", ".xlsx", ".xlsm"))
+        if found:
+            mp = found[0]
+            print(f"发现舱单: {mp.name}\n")
+    if mp:
+        if not mp.exists():
+            print(f"!! 找不到舱单: {mp}\n")
+        else:
+            want = load_manifest(mp)
+            have = {k for k, _, _, _ in matched} | {k for k, _ in singles}
+            lack = sorted(want - have)
+            more = sorted(have - want)
+            print(f"--- 舱单核对 ({mp.name}) ---")
+            print(f"  舱单共      {len(want)} 票")
+            print(f"  手上有      {len(have)} 票")
+            print(f"  舱单有你没有 {len(lack)} 票")
+            print(f"  你有舱单没有 {len(more)} 票")
+            if lack:
+                print("  缺这些:")
+                for k in lack:
+                    print(f"     {k}")
+            if more:
+                print("  多这些:")
+                for k in more:
+                    print(f"     {k}")
+            print()
+            man_lines.append(("舱单核对", mp.name))
+            man_lines.append(("舱单票数", len(want)))
+            man_lines.append(("手上票数", len(have)))
+            for k in lack:
+                man_lines.append(("舱单有你没有", k))
+            for k in more:
+                man_lines.append(("你有舱单没有", k))
+
     rows = []
     batches = ([matched] if args.chunk <= 0
                else [matched[i:i + args.chunk] for i in range(0, len(matched), args.chunk)])
@@ -325,6 +410,10 @@ def main():
             wtr = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
             wtr.writeheader()
             wtr.writerows(rows)
+        if man_lines:
+            fh.write("\n舱单核对\n项目,内容\n")
+            for x, y in man_lines:
+                fh.write(f'"{x}","{y}"\n')
         fh.write("\n问题清单\n文件,原因\n")
         for n, why in problems:
             fh.write(f'"{n}","{why}"\n')
