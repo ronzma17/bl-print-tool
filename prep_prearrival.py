@@ -336,9 +336,44 @@ def first_page_text(path: Path):
         return 0, ""
 
 
+def core_mbl(v: str) -> str:
+    """第一叠报告里的 MBL 带船公司前缀(CMDUCHN4029326),
+       Pre-Arrival 文件名是裸号(CHN4029326), 比对前先把前缀剥掉。
+
+       这里不能用模糊搜索 —— KEY_PATTERN 扫 CMDUCHN4029326 会从第 4 位
+       匹配出 UCHN4029326, 切错位置。所以改成逐个长度试着剥, 剥完必须
+       整体符合提单号格式才算数。"""
+    v = (v or "").strip().upper()
+    if not v:
+        return ""
+    if KEY_PATTERN.fullmatch(v):
+        return v
+    for n in (4, 3, 2):
+        if KEY_PATTERN.fullmatch(v[n:]):
+            return v[n:]
+    m = KEY_PATTERN.search(v)
+    return m.group(0) if m else v
+
+
 def load_order(report: Path):
     """从第一叠的报告里读出 (HBL, MBL) 顺序。第一叠现在出的是 xlsx, 老的 csv 也还认。"""
     order = []
+    if report.suffix.lower() in (".xlsx", ".xlsm"):
+        from openpyxl import load_workbook
+        ws = load_workbook(str(report), read_only=True, data_only=True)["明细"]
+        rows = ws.iter_rows(values_only=True)
+        head = [("" if v is None else str(v)).strip() for v in next(rows)]
+        try:
+            im, ih = head.index("MBL"), head.index("HBL")
+        except ValueError:
+            return []
+        for row in rows:
+            mbl = ("" if row[im] is None else str(row[im])).strip()
+            if not mbl:
+                break
+            hbl = ("" if ih >= len(row) or row[ih] is None else str(row[ih])).strip()
+            order.append((hbl, mbl))
+        return order
     with open(report, encoding="utf-8-sig", newline="") as fh:
         for row in csv.DictReader(fh):
             mbl = (row.get("MBL") or "").strip()
@@ -391,8 +426,13 @@ def main():
 
     # ---- 决定顺序 ----
     order, source = [], ""
-    report = Path(args.order_from) if args.order_from else (out_dir / "_报告.csv")
-    if report.exists():
+    report = Path(args.order_from) if args.order_from else None
+    if report is None:                       # 自己找: 先 xlsx 后 csv
+        for cand in ("_报告.xlsx", "_报告.csv"):
+            if (out_dir / cand).exists():
+                report = out_dir / cand
+                break
+    if report and report.exists():
         order = load_order(report)
         source = f"照第一叠的顺序 ({report.name})"
     else:
@@ -408,7 +448,7 @@ def main():
     rows, missing, used = [], 0, set()
 
     for i, (hbl, mbl) in enumerate(order, 1):
-        p = by_mbl.get(mbl)
+        p = by_mbl.get(core_mbl(mbl))
         if p is None:
             missing += 1
             if writer is not None:
@@ -419,8 +459,8 @@ def main():
                          "件数": "", "重量": "", "材积": "",
                          "状态": "缺 Pre-Arrival,已插空白纸占位"})
             continue
-        used.add(mbl)
-        _, npages, hbl_in_pdf, cons, mode, dest, eta = meta[mbl]
+        used.add(core_mbl(mbl))
+        _, npages, hbl_in_pdf, cons, mode, dest, eta = meta[core_mbl(mbl)]
         take = [x for x in TAKE_PAGES if x <= npages]
         if writer is not None:
             r = PdfReader(str(p))
@@ -449,7 +489,7 @@ def main():
         print()
         print("   第一叠报告里的前 5 个 MBL:")
         for h, m in order[:5]:
-            print(f"      {m}   (HBL {h})")
+            print(f"      {core_mbl(m)}   (HBL {h})")
         print()
         print("   Pre-Arrival 文件夹里的前 5 个 MBL:")
         for m in sorted(by_mbl)[:5]:
