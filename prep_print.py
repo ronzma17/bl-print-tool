@@ -64,6 +64,80 @@ def writable_path(p: Path) -> Path:
         return p
 
 
+def layout_lines(page, ytol=3.0):
+    """pypdf 直接 extract_text 会把 Waybill 的表格打乱(列顺序全错),
+       layout 模式对这种 CID 字体又返回空。
+       所以自己重建: 用 visitor 拿到每段文字的 x/y 坐标,
+       按 y 归成一行、按 x 从左到右排序。"""
+    items = []
+
+    def visit(text, cm, tm, font_dict, font_size):
+        if text and text.strip():
+            items.append((round(tm[5], 1), tm[4], text.strip()))
+
+    try:
+        page.extract_text(visitor_text=visit)
+    except Exception:
+        return []
+    items.sort(key=lambda t: (-t[0], t[1]))
+    lines, cur, cury = [], [], None
+    for y, x, txt in items:
+        if cury is None or abs(y - cury) <= ytol:
+            cur.append((x, txt))
+            cury = y if cury is None else cury
+        else:
+            lines.append(" ".join(t for _, t in sorted(cur)))
+            cur, cury = [(x, txt)], y
+    if cur:
+        lines.append(" ".join(t for _, t in sorted(cur)))
+    return lines
+
+
+CARGO_ROW = re.compile(
+    r"^([A-Z]{4}\d{7})\s+(\d+)\s*[xX]\s*(\d{2}[A-Z]{2})\s+([\d,]+)\s*([A-Z()]+)"
+    r"\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)")
+SEAL_ROW  = re.compile(r"^SEAL\s+(\S+)")
+TOTAL_CNT = re.compile(r"(\d+)\s*CONTAINER\(S\)")
+
+
+def parse_waybill(path: Path):
+    """从 Waybill 第 1 页抠货物信息。
+       版面长这样:
+           CMAU7833997   1 x 40HC   1018 CARTONS   16619.000   3700   68.000
+           SEAL R9073324
+           Weight in Kgs Total: 1 CONTAINER(S)
+       返回 {柜数, 柜号, 封条, 柜型, 件数, 重量, 材积}, 失败返回 {}"""
+    try:
+        lines = layout_lines(PdfReader(str(path)).pages[0])
+    except Exception:
+        return {}
+
+    cons, seals, declared = [], [], ""
+    for raw in lines:
+        for l in raw.split("\n"):
+            l = l.strip()
+            m = CARGO_ROW.match(l)
+            if m and not any(c[0] == m.group(1) for c in cons):
+                cons.append(m.groups())
+            m2 = SEAL_ROW.match(l)
+            if m2 and m2.group(1) not in seals:
+                seals.append(m2.group(1))
+            m3 = TOTAL_CNT.search(l)
+            if m3 and not declared:
+                declared = m3.group(1)
+
+    if not cons:
+        return {}
+    j = lambda i: ",".join(c[i] for c in cons)
+    return {
+        "柜数": declared or str(len(cons)),
+        "柜号": j(0),
+        "封条": ",".join(seals) if seals else "",
+        "柜型": j(2),
+        "件数": j(3),            # 单位(CARTONS)已经分开, 不带进来
+        "重量": j(5),
+        "材积": j(7),
+    }
 
 
 def manifest_rows(path: Path):
@@ -542,6 +616,21 @@ def main():
                 note = f"Waybill 只有 {nwb} 页"
 
             info = man_info.get(key, {})
+            cargo = parse_waybill(wb)
+            if not cargo:
+                note = (note + " / " if note else "") + "Waybill 货物信息读不出来"
+            else:
+                # 跟舱单的箱型箱量对一下, 多柜最容易在这里出岔子
+                want_n = info.get("柜数舱单", "")
+                got_n = cargo.get("柜号", "").count(",") + 1 if cargo.get("柜号") else 0
+                if want_n and int(want_n) != got_n:
+                    note = (note + " / " if note else "") + \
+                           f"柜数对不上: 舱单 {want_n} 个, Waybill 只读出 {got_n} 个"
+                want_t = (info.get("柜型舱单", "") or "").upper()
+                got_t = {x.strip().upper() for x in cargo.get("柜型", "").split(",") if x.strip()}
+                if want_t and got_t and want_t not in got_t:
+                    note = (note + " / " if note else "") + \
+                           f"柜型对不上: 舱单 {want_t}, Waybill {'/'.join(sorted(got_t))}"
             dest = info.get("目的港", "")
             mode = ""
             if dest:
@@ -549,10 +638,13 @@ def main():
             rows.append({
                 "MBL": (SCAC + key) if key else "",
                 "HBL": hbl,
-                "柜数": info.get("柜数舱单", "") or "",
-                "柜号": "", "封条": "",
-                "柜型": info.get("柜型舱单", "") or "",
-                "件数": "", "重量": "", "材积": "",
+                "柜数": cargo.get("柜数", "") or info.get("柜数舱单", "") or "",
+                "柜号": cargo.get("柜号", ""),
+                "封条": cargo.get("封条", ""),
+                "柜型": cargo.get("柜型", "") or info.get("柜型舱单", "") or "",
+                "件数": cargo.get("件数", ""),
+                "重量": cargo.get("重量", ""),
+                "材积": cargo.get("材积", ""),
                 "运输方式": mode, "目的地": dest, "ETA": "",
                 "状态": note or "正常",
                 "第几张纸": start_sheet, "批次": bi,
