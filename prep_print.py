@@ -100,6 +100,125 @@ SEAL_ROW  = re.compile(r"^SEAL\s+(\S+)")
 TOTAL_CNT = re.compile(r"(\d+)\s*CONTAINER\(S\)")
 
 
+def hbl_items(page):
+    """收集每段文字的坐标。tm[4]=x, tm[5]=y(这种 B/L 上 y 向下增大)。
+       坐标为 0 的是渲染残留, 丢掉。"""
+    out = []
+
+    def v(t, cm, tm, fd, fs):
+        if t and t.strip():
+            out.append((round(tm[5], 1), round(tm[4], 1), t.strip()))
+
+    try:
+        page.extract_text(visitor_text=v)
+    except Exception:
+        return []
+    return sorted(z for z in out if z[0] > 1 and z[1] > 1)
+
+
+def group_rows(sel, ytol=4):
+    """把同一 y 上的碎片拼成一行, 按 x 从左到右。"""
+    out, cur, last = [], [], None
+    for y, x, t in sorted(sel):
+        if last is not None and abs(y - last) > ytol:
+            out.append(" ".join(z for _, _, z in sorted(cur, key=lambda a: a[1])))
+            cur = []
+        cur.append((y, x, t))
+        last = y
+    if cur:
+        out.append(" ".join(z for _, _, z in sorted(cur, key=lambda a: a[1])))
+    return out
+
+
+def parse_hbl(path: Path):
+    """从 Transport B/L 抠出 shipper / consignee / notify / marks / description。
+
+       这张单子上 "Shipper" "Consignee or order" 这些标签是背景图不是文字,
+       所以认不了标签, 只能靠坐标分区:
+         左侧 x<300、港口行以上  -> 按 y 的空档切成三块, 依次是三个当事人
+         港口行以下、柜号行以上  -> x<168 是 Marks, 280<=x<560 是 Description
+
+       还有个坑: consignee/notify 写不下时末尾会带一个 *,
+       真正的后续内容跑到 Description 下面以 * 开头的那几行去了, 要接回来。"""
+    try:
+        it = hbl_items(PdfReader(str(path)).pages[0])
+    except Exception:
+        return {}
+    if not it:
+        return {}
+
+    left = [z for z in it if z[1] < 300 and z[0] < 460]
+    bl, cur, last = [], [], None
+    for y, x, t in left:
+        if last is not None and y - last > 25:
+            bl.append(cur)
+            cur = []
+        cur.append((y, x, t))
+        last = y
+    if cur:
+        bl.append(cur)
+
+    res = {"_blocks": len(bl)}
+    for i, k in enumerate(("shipper", "consignee", "notify")):
+        res[k] = "\n".join(t for _, _, t in bl[i]) if i < len(bl) else ""
+
+    cy = [y for y, x, t in it if y > 460 and CONTAINER_PATTERN.fullmatch(t)]
+    y1 = min(cy) - 6 if cy else 680
+    marks = group_rows([z for z in it if 460 < z[0] < y1 and z[1] < 168])
+    desc  = group_rows([z for z in it if 460 < z[0] < y1 and 280 <= z[1] < 560])
+
+    star = next((i for i, l in enumerate(desc) if l.startswith("*")), None)
+    cont = []
+    if star is not None:
+        cont = [l.lstrip("*").strip() for l in desc[star:]]
+        desc = desc[:star]
+    for k in ("consignee", "notify"):
+        if res[k].rstrip().endswith("*"):
+            res[k] = res[k].rstrip().rstrip("*") + (("\n" + "\n".join(cont)) if cont else "")
+
+    res["marks"] = "\n".join(marks)
+    res["desc"] = "\n".join(desc)
+    return res
+
+
+# Description 区不该出现的东西。出现了说明 x 边界漏进了别的栏位。
+STRAY = ("CY-CY", "CY -CY", "SAY TOTAL", "FREIGHT PREPAID", "FREIGHT COLLECT",
+         "ON BOARD", "TELEX RELEASE", "AGENT:", "AWELL LOGISTICS")
+
+
+
+
+def check_hbl(party, nblocks):
+    """B/L 解析的自检。
+       切块靠行距、Marks/Description 靠 x 坐标画框, 都有可能失手,
+       所以把能自动发现的异常都列出来, 让人去看那几票, 而不是全部人工核对。"""
+    bad = []
+    # 左侧除了三个当事人, 下面还有船名/港口两行, 所以块数通常是 4~5。
+    # 取前三块当当事人, 只有不足 3 块才是真出问题。
+    if nblocks < 3:
+        bad.append(f"左侧只切出 {nblocks} 块, 三个当事人没分全")
+    for k, name in (("shipper", "Shipper"), ("consignee", "Consignee"),
+                    ("notify", "Notify"), ("marks", "Marks"),
+                    ("desc", "Description")):
+        if not (party.get(k) or "").strip():
+            bad.append(f"{name} 是空的")
+    desc = (party.get("desc") or "").upper()
+    hit = [w for w in STRAY if w in desc]
+    if hit:
+        bad.append("Description 里混进了 " + "/".join(hit))
+    if CONTAINER_PATTERN.search(desc.replace("\n", " ")):
+        bad.append("Description 里混进了柜号")
+    # 当事人栏里混进船名/港口 -> 说明块边界串了
+    for k, name in (("shipper", "Shipper"), ("consignee", "Consignee"), ("notify", "Notify")):
+        up = (party.get(k) or "").upper()
+        if "CMA CGM" in up or "PORT OF" in up:
+            bad.append(f"{name} 里混进了船名或港口")
+    for k, name in (("shipper", "Shipper"), ("consignee", "Consignee"), ("notify", "Notify")):
+        if (party.get(k) or "").count("\n") >= 9:
+            bad.append(f"{name} 有 {party[k].count(chr(10))+1} 行, 可能把下一块也吞进来了")
+    return bad
+
+
 def parse_waybill(path: Path):
     """从 Waybill 第 1 页抠货物信息。
        版面长这样:
@@ -235,12 +354,17 @@ S1_FIELDS = [
     ("MBL",      "MBL"),
     ("HBL",      "HBL"),
     ("柜数",     "柜数"),
+    ("Shipper",            "Shipper"),
+    ("Consignee or order", "Consignee"),
+    ("Notify address",     "Notify"),
     ("柜号",     "柜号"),
     ("封条",     "封条"),
     ("柜型",     "柜型"),
     ("件数",     "件数"),
     ("重量",     "重量"),
     ("材积",     "材积"),
+    ("Marks and Numbers",   "Marks"),
+    ("Description of Goods","Description"),
     ("运输方式", "运输方式"),
     ("目的地",   "目的地"),
     ("ETA",      "ETA"),
@@ -289,6 +413,7 @@ def write_s1_report(out_dir, rows, problems, man_lines):
         return path
 
     ORANGE = PatternFill("solid", fgColor="FCE4D6")
+    PURPLE = PatternFill("solid", fgColor="E4DFEC")   # Notify 里没有邮箱
     HEAD   = PatternFill("solid", fgColor="DDEBF7")
     RED    = Font(color="C00000", bold=True)   # Ramp
 
@@ -297,13 +422,21 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     for c in range(1, len(headers) + 1):
         ws.cell(1, c).font = Font(bold=True); ws.cell(1, c).fill = HEAD
 
-    size_col = keys.index("柜型") + 1
+    from openpyxl.styles import Alignment
+    size_col   = keys.index("柜型") + 1
+    notify_col = keys.index("Notify") + 1
+    wrap_cols  = [keys.index(k) + 1 for k in
+                  ("Shipper", "Consignee", "Notify", "Marks", "Description")]
     for r in rows:
         ws.append([("" if r.get(k) in (None,) else r.get(k)) for k in keys])
         i = ws.max_row
         if str(r.get("运输方式", "")).lower() == "ramp":
             for c in range(1, len(headers) + 1):
                 ws.cell(i, c).font = RED
+        for c in wrap_cols:                       # 多行内容要自动换行才看得见
+            ws.cell(i, c).alignment = Alignment(wrap_text=True, vertical="top")
+        if "@" not in str(r.get("Notify", "")):   # Notify 里没有邮箱 -> 标紫
+            ws.cell(i, notify_col).fill = PURPLE
         sz = str(r.get("柜型", ""))
         if sz and any(x.strip().upper() != "40HC" for x in sz.split(",")):
             ws.cell(i, size_col).fill = ORANGE
@@ -311,6 +444,9 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{L(len(headers))}{ws.max_row}"
     for c, (h, k) in enumerate(S1_FIELDS, 1):
+        if k in ("Shipper", "Consignee", "Notify", "Marks", "Description"):
+            ws.column_dimensions[L(c)].width = 42
+            continue
         longest = max([len(str(h))] + [len(str(x.get(k, ""))) for x in rows] or [0])
         ws.column_dimensions[L(c)].width = min(max(longest + 2, 8), 40)
 
@@ -328,7 +464,10 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     ramp = sum(1 for r in rows if str(r.get("运输方式", "")).lower() == "ramp")
     odd  = sum(1 for r in rows if r.get("柜型") and
                any(x.strip().upper() != "40HC" for x in str(r["柜型"]).split(",")))
+    nomail = sum(1 for r in rows if "@" not in str(r.get("Notify", "")))
     print(f"  Ramp(转铁路) {ramp} 票 -> 整行红字")
+    if nomail:
+        print(f"  Notify 里没有邮箱 {nomail} 票 -> 该格标紫")
     print(f"  非 40HC 柜型 {odd} 票 -> 柜型格标橙")
 
     path = writable_path(out_dir / "_报告.xlsx")
@@ -616,6 +755,14 @@ def main():
                 note = f"Waybill 只有 {nwb} 页"
 
             info = man_info.get(key, {})
+            party = parse_hbl(bl)
+            # Notify 的公司名通常跟 Consignee 一模一样, 那就不用重复显示。
+            # 不一样才把那个名字留在格子里并高亮, 因为这种是要人工确认的。
+            if not party:
+                note = (note + " / " if note else "") + "B/L 读不出来"
+            else:
+                for w in check_hbl(party, party.get("_blocks", 0)):
+                    note = (note + " / " if note else "") + w
             cargo = parse_waybill(wb)
             if not cargo:
                 note = (note + " / " if note else "") + "Waybill 货物信息读不出来"
@@ -638,6 +785,11 @@ def main():
             rows.append({
                 "MBL": (SCAC + key) if key else "",
                 "HBL": hbl,
+                "Shipper": party.get("shipper", ""),
+                "Consignee": party.get("consignee", ""),
+                "Notify": party.get("notify", ""),
+                "Marks": party.get("marks", ""),
+                "Description": party.get("desc", ""),
                 "柜数": cargo.get("柜数", "") or info.get("柜数舱单", "") or "",
                 "柜号": cargo.get("柜号", ""),
                 "封条": cargo.get("封条", ""),
