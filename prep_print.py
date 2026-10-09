@@ -186,6 +186,35 @@ STRAY = ("CY-CY", "CY -CY", "SAY TOTAL", "FREIGHT PREPAID", "FREIGHT COLLECT",
          "ON BOARD", "TELEX RELEASE", "AGENT:", "AWELL LOGISTICS")
 
 
+# 公司名后缀。有些公司名在 B/L 上会折到第二行, 比如
+#   NAMSUN(GUANGZHOU) INTERNATIONAL  LOGISTICS
+#   CO.,LTD.
+# 只取第一行就把 CO.,LTD. 丢了, 所以碰到这种要把下一行接回来。
+SUFFIX = re.compile(r"^(CO\s*\.?\s*,?\s*LTD|LTD|INC|LLC|CORP|CORPORATION|COMPANY)\s*\.?\s*,?$")
+
+
+def split_name(block: str):
+    """拆成 (公司名, 余下部分)。公司名 = 第一行; 折行时把续行接回来。"""
+    lines = [l.strip() for l in (block or "").split("\n") if l.strip()]
+    if not lines:
+        return "", ""
+    name, used = lines[0], 1
+    for nxt in lines[1:]:
+        if name.rstrip().endswith(",") or SUFFIX.match(nxt.upper()):
+            name = name.rstrip().rstrip(",") + " " + nxt
+            used += 1
+        else:
+            break
+    return re.sub(r"\s{2,}", " ", name).strip(), "\n".join(lines[used:])
+
+
+def first_name(block: str) -> str:
+    return split_name(block)[0]
+
+
+def norm_name(n: str) -> str:
+    """比较公司名用。去掉标点和多余空格, 免得 CO.,LTD. 和 CO., LTD 被当成两家。"""
+    return re.sub(r"[^A-Z0-9]", "", (n or "").upper())
 
 
 def check_hbl(party, nblocks):
@@ -354,8 +383,11 @@ S1_FIELDS = [
     ("MBL",      "MBL"),
     ("HBL",      "HBL"),
     ("柜数",     "柜数"),
+    ("Shipper Name",       "ShipperName"),
     ("Shipper",            "Shipper"),
+    ("Consignee Name",     "ConsigneeName"),
     ("Consignee or order", "Consignee"),
+    ("Notify Name",        "NotifyName"),
     ("Notify address",     "Notify"),
     ("柜号",     "柜号"),
     ("封条",     "封条"),
@@ -414,6 +446,7 @@ def write_s1_report(out_dir, rows, problems, man_lines):
 
     ORANGE = PatternFill("solid", fgColor="FCE4D6")
     PURPLE = PatternFill("solid", fgColor="E4DFEC")   # Notify 里没有邮箱
+    YELLOW = PatternFill("solid", fgColor="FFF2CC")   # Notify 公司名跟 Consignee 不同
     HEAD   = PatternFill("solid", fgColor="DDEBF7")
     RED    = Font(color="C00000", bold=True)   # Ramp
 
@@ -425,6 +458,7 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     from openpyxl.styles import Alignment
     size_col   = keys.index("柜型") + 1
     notify_col = keys.index("Notify") + 1
+    nname_col  = keys.index("NotifyName") + 1
     wrap_cols  = [keys.index(k) + 1 for k in
                   ("Shipper", "Consignee", "Notify", "Marks", "Description")]
     for r in rows:
@@ -435,7 +469,12 @@ def write_s1_report(out_dir, rows, problems, man_lines):
                 ws.cell(i, c).font = RED
         for c in wrap_cols:                       # 多行内容要自动换行才看得见
             ws.cell(i, c).alignment = Alignment(wrap_text=True, vertical="top")
-        if "@" not in str(r.get("Notify", "")):   # Notify 里没有邮箱 -> 标紫
+        # 跟 Consignee 不一样的那一格标黄: 名字归名字, 地址归地址
+        if r.get("NotifyDiff"):
+            ws.cell(i, nname_col).fill = YELLOW
+        if r.get("NotifyAddrDiff"):
+            ws.cell(i, notify_col).fill = YELLOW
+        elif not r.get("NotifySameAs") and "@" not in str(r.get("Notify", "")):
             ws.cell(i, notify_col).fill = PURPLE
         sz = str(r.get("柜型", ""))
         if sz and any(x.strip().upper() != "40HC" for x in sz.split(",")):
@@ -464,7 +503,11 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     ramp = sum(1 for r in rows if str(r.get("运输方式", "")).lower() == "ramp")
     odd  = sum(1 for r in rows if r.get("柜型") and
                any(x.strip().upper() != "40HC" for x in str(r["柜型"]).split(",")))
-    nomail = sum(1 for r in rows if "@" not in str(r.get("Notify", "")))
+    ndiff  = sum(1 for r in rows if r.get("NotifyDiff") or r.get("NotifyAddrDiff"))
+    nomail = sum(1 for r in rows if not r.get("NotifyDiff") and not r.get("NotifySameAs")
+                 and "@" not in str(r.get("Notify", "")))
+    if ndiff:
+        print(f"  Notify 跟 Consignee 不一致 {ndiff} 票 -> 不一致的那格标黄")
     print(f"  Ramp(转铁路) {ramp} 票 -> 整行红字")
     if nomail:
         print(f"  Notify 里没有邮箱 {nomail} 票 -> 该格标紫")
@@ -755,9 +798,36 @@ def main():
                 note = f"Waybill 只有 {nwb} 页"
 
             info = man_info.get(key, {})
+            # HBL 用舱单上的托单编号(带 AIC 前缀), 舱单里没有就退回文件名里的号
+            hbl_show = info.get("HBL舱单", "") or hbl
+            if info.get("HBL舱单"):
+                if hbl and hbl not in info["HBL舱单"]:
+                    note = (note + " / " if note else "") + \
+                           f"HBL 对不上: 文件名 {hbl}, 舱单 {info['HBL舱单']}"
+            elif info:
+                note = (note + " / " if note else "") + "舱单上没有托单编号, HBL 用的是文件名里的号"
+            elif man_info:
+                note = (note + " / " if note else "") + "这票不在舱单里"
             party = parse_hbl(bl)
+            sh_name, sh_rest = split_name(party.get("shipper", ""))
+            cn_name, cn_rest = split_name(party.get("consignee", ""))
+            nt_name, nt_rest = split_name(party.get("notify", ""))
             # Notify 的公司名通常跟 Consignee 一模一样, 那就不用重复显示。
             # 不一样才把那个名字留在格子里并高亮, 因为这种是要人工确认的。
+            # Notify 正常情况跟 Consignee 一模一样。名字和地址分开比,
+            # 哪一半不一样就标哪一格 —— 地址少一行多一行也算不一样。
+            nt_same_as = "SAMEASCONSIGNEE" in norm_name(party.get("notify", ""))
+            if nt_same_as:
+                nt_name_show, nt_show = "", party.get("notify", "")
+                nt_diff = nt_addr_diff = False
+            else:
+                nt_name_show, nt_show = nt_name, nt_rest
+                nt_diff = norm_name(nt_name) != norm_name(cn_name)
+                nt_addr_diff = norm_name(nt_rest) != norm_name(cn_rest)
+            if nt_diff:
+                note = (note + " / " if note else "") + f"Notify 公司名跟 Consignee 不同: {nt_name}"
+            if nt_addr_diff:
+                note = (note + " / " if note else "") + "Notify 地址跟 Consignee 不同"
             if not party:
                 note = (note + " / " if note else "") + "B/L 读不出来"
             else:
@@ -784,10 +854,16 @@ def main():
                 mode = "Ramp" if dest != main_pod else "Port"
             rows.append({
                 "MBL": (SCAC + key) if key else "",
-                "HBL": hbl,
-                "Shipper": party.get("shipper", ""),
-                "Consignee": party.get("consignee", ""),
-                "Notify": party.get("notify", ""),
+                "HBL": hbl_show,
+                "ShipperName": sh_name,
+                "Shipper": sh_rest,
+                "ConsigneeName": cn_name,
+                "Consignee": cn_rest,
+                "NotifyName": nt_name_show,
+                "Notify": nt_show,
+                "NotifyDiff": nt_diff,
+                "NotifyAddrDiff": nt_addr_diff,
+                "NotifySameAs": nt_same_as,
                 "Marks": party.get("marks", ""),
                 "Description": party.get("desc", ""),
                 "柜数": cargo.get("柜数", "") or info.get("柜数舱单", "") or "",

@@ -144,6 +144,8 @@ def parse_containers(text):
 FIELDS = [
     ("第几张纸", "第几张纸"),
     ("HBL",     "HBL"),
+    ("重量",     "重量"),        # C 列: 提到前面, 核对用
+    ("ETA",     "ETA"),         # D 列: 提到前面, 核对用
     ("MBL",     "MBL"),
     ("文件",     "文件"),
     ("运输方式", "运输方式"),
@@ -155,6 +157,7 @@ FIELDS = [
     ("件数",     "件数"),
     ("重量",     "重量"),        # 原本的位置
     ("材积",     "材积"),
+    ("ETA",     "ETA"),         # 原本的位置
     ("状态",     "状态"),
 ]
 HEADERS = [h for h, _ in FIELDS]
@@ -256,6 +259,23 @@ def parse_mode(text):
         v = l.strip()
         if v.lower() in ("port", "ramp", "door"):
             return v.capitalize()
+    return ""
+
+
+def parse_eta(text):
+    """POD ETA。版面上它紧跟在 DEST.CARG MODE 的值后面,
+       抽出来就是 Port/Ramp 那行的下一行。
+       另一个日期(09/22/2026 07:21 PM)是通知的签发时间, 别搞混。"""
+    lines = [l.strip() for l in text.split("\n")]
+    bare = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    for i, l in enumerate(lines):
+        if l.lower() in ("port", "ramp", "door"):
+            for nxt in lines[i + 1:i + 4]:
+                if bare.match(nxt):
+                    return nxt
+    for l in lines:                      # 兜底: 第一个不带时间的日期
+        if bare.match(l):
+            return l
     return ""
 
 
@@ -363,7 +383,7 @@ def main():
             continue
         h = HBL_PATTERN.search(txt)
         meta[mbl] = (p, npages, h.group(0) if h else "", parse_containers(txt),
-                     parse_mode(txt), final_dest(txt))
+                     parse_mode(txt), final_dest(txt), parse_eta(txt))
         if mbl in by_mbl:
             dupes.append(p.name)
             continue
@@ -394,13 +414,13 @@ def main():
             if writer is not None:
                 writer.add_blank_page(width=612, height=792)   # Letter 空白占位
             rows.append({"第几张纸": i, "HBL": hbl, "MBL": mbl, "文件": "",
-                         "运输方式": "", "目的地": "",
+                         "运输方式": "", "目的地": "", "ETA": "",
                          "柜数": 0, "柜号": "", "封条": "", "柜型": "",
                          "件数": "", "重量": "", "材积": "",
                          "状态": "缺 Pre-Arrival,已插空白纸占位"})
             continue
         used.add(mbl)
-        _, npages, hbl_in_pdf, cons, mode, dest = meta[mbl]
+        _, npages, hbl_in_pdf, cons, mode, dest, eta = meta[mbl]
         take = [x for x in TAKE_PAGES if x <= npages]
         if writer is not None:
             r = PdfReader(str(p))
@@ -414,7 +434,7 @@ def main():
         if not cons:
             note = (note + " / " if note else "") + "柜信息读不出来"
         rows.append({"第几张纸": i, "HBL": hbl, "MBL": mbl, "文件": p.name,
-                     "运输方式": mode, "目的地": dest,
+                     "运输方式": mode, "目的地": dest, "ETA": eta,
                      "柜数": len(cons),
                      "柜号": join_col(cons, 0), "封条": join_col(cons, 1),
                      "柜型": join_col(cons, 2), "件数": join_col(cons, 3),
