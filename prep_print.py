@@ -25,6 +25,7 @@ import re
 import shutil
 import sys
 import zipfile
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -328,7 +329,7 @@ def manifest_rows(path: Path):
         hbl = next((v.upper() for v in r if HBL_PATTERN.search(v.upper())), "")
         sz  = next((SIZE.search(v) for v in r if SIZE.search(v)), None)
         pods = [v for v in r if v.isupper() and v.replace(" ", "").isalpha() and len(v) > 3]
-        out[mbl] = {
+        out.setdefault(mbl, []).append({
             "HBL舱单": hbl,
             "柜数舱单": int(sz.group(1)) if sz else "",
             "柜型舱单": sz.group(2) if sz else "",
@@ -336,8 +337,23 @@ def manifest_rows(path: Path):
             "目的港": pods[1] if len(pods) > 1 else "",
             "备注": next((v for v in r if any(ch > "\u4e00" for ch in v)), ""),
             "文件包": next((v for v in r if v.upper().startswith("PART")), ""),
-        }
+        })
     return out
+
+
+def pick_manifest(records, hbl):
+    """一个 MBL 在舱单里可能占好几行(分单给不同客户), 按 HBL 挑出对应那行。
+       舱单上的号带 AIC 前缀(AIC2610A334703A), 文件名里是裸号(2610A334703A),
+       所以用包含判断而不是相等。"""
+    if not records:
+        return {}
+    if len(records) == 1:
+        return records[0]
+    if hbl:
+        for r in records:
+            if hbl in (r.get("HBL舱单") or ""):
+                return r
+    return records[0]
 
 
 def load_manifest(path: Path):
@@ -454,6 +470,7 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     HEAD   = PatternFill("solid", fgColor="DDEBF7")
     RED    = Font(color="C00000", bold=True)   # Ramp
     BLUEFILL = PatternFill("solid", fgColor="DDEBF7")   # 起始港跟大多数不一样
+    LILAC    = PatternFill("solid", fgColor="EDE7F6")   # 这一行有问题, 整行淡紫
 
     wb = Workbook(); ws = wb.active; ws.title = "明细"
     ws.append(headers)
@@ -477,6 +494,9 @@ def write_s1_report(out_dir, rows, problems, man_lines):
         if r.get("PolOdd"):
             for c in range(1, len(headers) + 1):
                 ws.cell(i, c).fill = BLUEFILL
+        if r.get("Issue"):          # 有问题的整行淡紫, 压过起始港的蓝底
+            for c in range(1, len(headers) + 1):
+                ws.cell(i, c).fill = LILAC
         for c in wrap_cols:                       # 多行内容要自动换行才看得见
             ws.cell(i, c).alignment = Alignment(wrap_text=True, vertical="top")
         # 跟 Consignee 不一样的那一格标黄: 名字归名字, 地址归地址
@@ -514,6 +534,9 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     odd  = sum(1 for r in rows if r.get("柜型") and
                any(x.strip().upper() != "40HC" for x in str(r["柜型"]).split(",")))
     ndiff  = sum(1 for r in rows if r.get("NotifyDiff") or r.get("NotifyAddrDiff"))
+    nissue = sum(1 for r in rows if r.get("Issue"))
+    if nissue:
+        print(f"  有问题需要看的 {nissue} 票 -> 整行淡紫, 详见状态列")
     npol   = sum(1 for r in rows if r.get("PolOdd"))
     if npol:
         print(f"  起始港跟大多数不同 {npol} 票 -> 整行蓝底")
@@ -693,7 +716,10 @@ def main():
         print("输入文件夹里没有 PDF。请先把 zip 放进 1_DROP_ZIPS_HERE。")
         return
 
-    groups, problems = {}, []
+    # 一票 = 一个 HBL。同一个 MBL 下可以挂多个 HBL(分单给不同客户),
+    # 所以 B/L 按 (MBL, HBL) 存, Waybill 按 MBL 存 —— 船公司的 Waybill 是
+    # 按主提单发的, 一份会被同 MBL 下的几票共用。
+    bl_items, wb_items, problems = {}, {}, []
     for p in pdfs:
         key, k_name, hbl = kind_by_name(p)
         npages, txt = read_pdf(p)
@@ -707,34 +733,43 @@ def main():
             continue
         if k_text and k_name and k_text != k_name:
             problems.append((p.name, f"文件名像 {k_name} 但内容像 {k_text},已按文件名处理"))
-        slot = groups.setdefault(key, {})
-        if kind in slot:
-            problems.append((p.name, f"{key} 的 {kind} 重复"))
-            continue
-        slot[kind] = (p, npages)
         if kind == "bl":
-            slot["hbl"] = hbl
+            if not hbl:
+                problems.append((p.name, f"{key}: B/L 文件名里没找到 HBL 号,排到最后"))
+            if (key, hbl) in bl_items:
+                problems.append((p.name, f"{key} {hbl}: 同一个 HBL 有两份 B/L, 用了先读到的那份"))
+                continue
+            bl_items[(key, hbl)] = (p, npages)
+        else:
+            if key in wb_items:
+                problems.append((p.name, f"{key}: 同一个 MBL 有两份 Waybill, 用了先读到的那份"))
+                continue
+            wb_items[key] = (p, npages)
 
     # 配不齐的(只有 B/L 没 Waybill, 或反过来)也照常进队列, 缺的那面补白页。
     # 这样整叠纸的顺序不会因为少一票而乱, 报告里也看得到它。
     matched, singles = [], []
-    for key in groups:
-        s = groups[key]
-        bl, wb = s.get("bl"), s.get("wb")
-        h = s.get("hbl", "")
-        if bl and wb:
-            if not h:
-                problems.append((bl[0].name, f"{key}: B/L 文件名里没找到 HBL 号,排到最后"))
+    used_wb = set()
+    for (key, hbl), bl in bl_items.items():
+        wb = wb_items.get(key)
+        if wb:
+            used_wb.add(key)
         else:
-            f = (bl or wb)[0]
-            lack = "缺 Waybill(反面留白)" if bl else "缺 Transport B/L(正面留白)"
-            singles.append((key, f))
-            problems.append((f.name, f"{key}: {lack}"))
-        matched.append((key, h, bl, wb))
+            singles.append((key, bl[0]))
+            problems.append((bl[0].name, f"{key}: 缺 Waybill(反面留白)"))
+        matched.append((key, hbl, bl, wb))
+    for key, wb in wb_items.items():          # 只有 Waybill 没 B/L 的
+        if key not in used_wb:
+            singles.append((key, wb[0]))
+            problems.append((wb[0].name, f"{key}: 缺 Transport B/L(正面留白)"))
+            matched.append((key, "", None, wb))
 
     # 按 HBL 排序; 没有 HBL 的排最后, 再按 MBL 排
     matched.sort(key=lambda x: (x[1] == "", x[1], x[0]))
     singles.sort(key=lambda x: x[0])
+
+    # 同一个 MBL 下有几票 —— 大于 1 就是分单, 这几票共用一份 Waybill
+    mbl_rows = Counter(m for m, _, _, _ in matched)
 
     print(f"共 {len(matched)} 票 | 其中配不齐的 {len(singles)} 票(缺的那面补白页) | 问题 {len(problems)}\n")
 
@@ -758,7 +793,11 @@ def main():
             lack = sorted(want - have)
             more = sorted(have - want)
             print(f"--- 舱单核对 ({mp.name}) ---")
-            print(f"  舱单共      {len(want)} 票")
+            man_lines_n = sum(len(v) for v in man.values())
+            if man_lines_n != len(want):
+                print(f"  舱单共      {len(want)} 个主提单 / {man_lines_n} 张分单")
+            else:
+                print(f"  舱单共      {len(want)} 票")
             print(f"  手上有      {len(have)} 票")
             print(f"  舱单有你没有 {len(lack)} 票")
             print(f"  你有舱单没有 {len(more)} 票")
@@ -773,6 +812,8 @@ def main():
             print()
             man_lines.append(("舱单核对", mp.name))
             man_lines.append(("舱单票数", len(want)))
+            if man_lines_n != len(want):
+                man_lines.append(("舱单分单行数", man_lines_n))
             man_lines.append(("手上票数", len(have)))
             for k in lack:
                 man_lines.append(("舱单有你没有", k))
@@ -781,10 +822,11 @@ def main():
 
     main_pod = main_pol = ""
     if man_info:
-        pods = [v.get("目的港", "") for v in man_info.values() if v.get("目的港")]
+        recs = [r for rs in man_info.values() for r in rs]
+        pods = [r.get("目的港", "") for r in recs if r.get("目的港")]
         if pods:
             main_pod = max(set(pods), key=pods.count)
-        pols = [v.get("始发港", "") for v in man_info.values() if v.get("始发港")]
+        pols = [r.get("始发港", "") for r in recs if r.get("始发港")]
         if pols:
             main_pol = max(set(pols), key=pols.count)
 
@@ -819,33 +861,40 @@ def main():
                                           height=last.mediabox.height)
             start_sheet = sheet + 1
             sheet += (total + pad) // 2
-            note = ""
-            if not bl:
-                note = "没有 Transport B/L, 正面是白页"
-            elif nbl != 1:
-                note = f"B/L 有 {nbl} 页, 正反面可能错位"
-            if not wb:
-                note = (note + " / " if note else "") + "没有 Waybill, 反面是白页"
-            elif nwb < max(WAYBILL_PAGES):
-                note = (note + " / " if note else "") + f"Waybill 只有 {nwb} 页"
+            # 这一行要说的话。hard=True 是真的数据问题 —— 明细里整行标淡紫,
+            # 提醒人去看。hard=False 是提示: 起始港有蓝底、Notify 有黄格,
+            # 已经各自标过了, 再把整行也染上反而看不出哪几行真的要处理。
+            msgs = []
 
-            info = man_info.get(key, {})
+            def say(m, hard=True):
+                msgs.append((m, hard))
+
+            if not bl:
+                say("没有 Transport B/L, 正面是白页")
+            elif nbl != 1:
+                say(f"B/L 有 {nbl} 页, 正反面可能错位")
+            if not wb:
+                say("没有 Waybill, 反面是白页")
+            elif nwb < max(WAYBILL_PAGES):
+                say(f"Waybill 只有 {nwb} 页")
+            if wb and mbl_rows[key] > 1:
+                say(f"同一个 MBL 下有 {mbl_rows[key]} 票分单, 共用这一份 Waybill")
+
+            info = pick_manifest(man_info.get(key, []), hbl)
             # HBL 用舱单上的托单编号(带 AIC 前缀), 舱单里没有就退回文件名里的号
             hbl_show = info.get("HBL舱单", "") or hbl
             if info.get("HBL舱单"):
                 if hbl and hbl not in info["HBL舱单"]:
-                    note = (note + " / " if note else "") + \
-                           f"HBL 对不上: 文件名 {hbl}, 舱单 {info['HBL舱单']}"
+                    say(f"HBL 对不上: 文件名 {hbl}, 舱单 {info['HBL舱单']}")
             elif info:
-                note = (note + " / " if note else "") + "舱单上没有托单编号, HBL 用的是文件名里的号"
+                say("舱单上没有托单编号, HBL 用的是文件名里的号")
             elif man_info:
-                note = (note + " / " if note else "") + "这票不在舱单里"
+                say("这票不在舱单里")
+
             party = parse_hbl(bl) if bl else {}
             sh_name, sh_rest = split_name(party.get("shipper", ""))
             cn_name, cn_rest = split_name(party.get("consignee", ""))
             nt_name, nt_rest = split_name(party.get("notify", ""))
-            # Notify 的公司名通常跟 Consignee 一模一样, 那就不用重复显示。
-            # 不一样才把那个名字留在格子里并高亮, 因为这种是要人工确认的。
             # Notify 正常情况跟 Consignee 一模一样。名字和地址分开比,
             # 哪一半不一样就标哪一格 —— 地址少一行多一行也算不一样。
             nt_same_as = "SAMEASCONSIGNEE" in norm_name(party.get("notify", ""))
@@ -857,38 +906,42 @@ def main():
                 nt_diff = norm_name(nt_name) != norm_name(cn_name)
                 nt_addr_diff = norm_name(nt_rest) != norm_name(cn_rest)
             if nt_diff:
-                note = (note + " / " if note else "") + f"Notify 公司名跟 Consignee 不同: {nt_name}"
+                say(f"Notify 公司名跟 Consignee 不同: {nt_name}", False)
             if nt_addr_diff:
-                note = (note + " / " if note else "") + "Notify 地址跟 Consignee 不同"
+                say("Notify 地址跟 Consignee 不同", False)
             if bl and not party:
-                note = (note + " / " if note else "") + "B/L 读不出来"
+                say("B/L 读不出来")
             elif party:
                 for w in check_hbl(party, party.get("_blocks", 0)):
-                    note = (note + " / " if note else "") + w
+                    say(w)
+
             cargo = parse_waybill(wb) if wb else {}
             if wb and not cargo:
-                note = (note + " / " if note else "") + "Waybill 货物信息读不出来"
-            else:
+                say("Waybill 货物信息读不出来")
+            elif cargo:     # 压根没有 Waybill 时上面已经说过了, 别再报一次柜数对不上
                 # 跟舱单的箱型箱量对一下, 多柜最容易在这里出岔子
                 want_n = info.get("柜数舱单", "")
                 got_n = cargo.get("柜号", "").count(",") + 1 if cargo.get("柜号") else 0
                 if want_n and int(want_n) != got_n:
-                    note = (note + " / " if note else "") + \
-                           f"柜数对不上: 舱单 {want_n} 个, Waybill 只读出 {got_n} 个"
+                    say(f"柜数对不上: 舱单 {want_n} 个, Waybill 只读出 {got_n} 个")
                 want_t = (info.get("柜型舱单", "") or "").upper()
                 got_t = {x.strip().upper() for x in cargo.get("柜型", "").split(",") if x.strip()}
                 if want_t and got_t and want_t not in got_t:
-                    note = (note + " / " if note else "") + \
-                           f"柜型对不上: 舱单 {want_t}, Waybill {'/'.join(sorted(got_t))}"
+                    say(f"柜型对不上: 舱单 {want_t}, Waybill {'/'.join(sorted(got_t))}")
+
             dest = info.get("目的港", "")
             pol = info.get("始发港", "")
             # 绝大多数是同一个起始港, 冒出别的就单独拎出来
             pol_odd = bool(pol) and bool(main_pol) and pol != main_pol
             if pol_odd:
-                note = (note + " / " if note else "") + f"起始港不是 {main_pol}, 是 {pol}"
+                say(f"起始港不是 {main_pol}, 是 {pol}", False)
             mode = ""
             if dest:
                 mode = "Ramp" if dest != main_pod else "Port"
+
+            note = " / ".join(m for m, _ in msgs)
+            issue = any(hard for _, hard in msgs)
+
             rows.append({
                 "MBL": (SCAC + key) if key else "",
                 "HBL": hbl_show,
@@ -913,6 +966,7 @@ def main():
                 "运输方式": mode, "起始港": pol, "目的地": dest, "ETA": "",
                 "PolOdd": pol_odd,
                 "状态": note or "正常",
+                "Issue": issue,
                 "第几张纸": start_sheet, "批次": bi,
                 "文件包": info.get("文件包", ""), "备注": info.get("备注", ""),
                 "BL文件": bl.name if bl else "", "Waybill文件": wb.name if wb else "",
