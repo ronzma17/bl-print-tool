@@ -516,6 +516,14 @@ def main():
             writer.write(fh)
         print(f"  {OUT_NAME}: {len(writer.pages)} 页 = {len(writer.pages)} 张纸 (单面打印)")
 
+        stale = out_dir / EXTRA_NAME
+        if not extras and stale.exists():
+            # 这一批没有多出来的票, 把上一批留下的删掉, 免得看着以为是这批的
+            try:
+                stale.unlink()
+                print(f"  清掉上一批的 {EXTRA_NAME}")
+            except Exception:
+                pass
         if extras:
             w = PdfWriter()
             for m in sorted(extras):

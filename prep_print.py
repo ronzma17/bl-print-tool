@@ -40,7 +40,10 @@ WAYBILL_PAGES = [1]                             # Waybill 只打第几页
 BL_HINT = "COMBINED TRANSPORT"
 WB_HINT = "WAYBILL"
 MARKER = "_batch.txt"                           # 记录本批归档到哪个文件夹
-EXTRA_OUT = ("_需人工处理.pdf", "_报告.csv")
+# 跑之前要清掉的上一批产物。报告改过格式(csv -> xlsx), 所以这里用前缀匹配,
+# 写死文件名的话改一次格式就漏一个, 旧文件会一直赖在输出文件夹里。
+EXTRA_OUT = ("_需人工处理.pdf", "_多出来的PREARRIVAL.pdf")
+OUT_PREFIX = ("PRINT", "_报告")
 # ==================================
 
 
@@ -529,7 +532,7 @@ def write_s1_report(out_dir, rows, problems, man_lines):
 
 
 def is_output_file(f: Path) -> bool:
-    return f.is_file() and (f.name.startswith("PRINT") or f.name in EXTRA_OUT)
+    return f.is_file() and (f.name.startswith(OUT_PREFIX) or f.name in EXTRA_OUT)
 
 
 def archive_old_output(out_dir: Path, archive_root: Path):
