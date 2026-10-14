@@ -179,6 +179,8 @@ def write_report(out_dir, rows, extras, by_mbl, nokey, dupes):
     YELLOW = PatternFill("solid", fgColor="FFF2CC")     # Ramp
     RED    = PatternFill("solid", fgColor="FFC7CE")     # 缺件
     HEAD   = PatternFill("solid", fgColor="DDEBF7")
+    LILAC  = PatternFill("solid", fgColor="EDE7F6")     # 同 MBL 分单, 不单独占纸
+    VIOLET = Font(color="7E57C2", bold=True)
 
     wb = Workbook()
     ws = wb.active
@@ -196,9 +198,14 @@ def write_report(out_dir, rows, extras, by_mbl, nokey, dupes):
             fill = RED
         elif str(r.get("运输方式", "")).lower() == "ramp":
             fill = YELLOW
+        if r.get("DupRow"):     # 不占纸的分单行 -> 淡紫底 + 淡紫字
+            fill = LILAC
         if fill:
             for c in range(1, len(HEADERS) + 1):
                 ws.cell(i, c).fill = fill
+        if r.get("DupRow"):
+            for c in range(1, len(HEADERS) + 1):
+                ws.cell(i, c).font = VIOLET
 
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}{ws.max_row}"
@@ -224,6 +231,9 @@ def write_report(out_dir, rows, extras, by_mbl, nokey, dupes):
     path = writable_path(out_dir / REPORT_NAME)
     wb.save(path)
 
+    ndup = sum(1 for r in rows if r.get("DupRow"))
+    if ndup:
+        print(f"  同 MBL 的分单 {ndup} 行 -> 不单独占纸, 第几张纸留空 + 淡紫字")
     ramp = sum(1 for r in rows if str(r.get("运输方式", "")).lower() == "ramp")
     print(f"  Ramp(转铁路) {ramp} 票, 已在报告里标黄")
     return path
@@ -446,23 +456,33 @@ def main():
     # ---- 拼页 ----
     writer = None if args.dry_run else PdfWriter()
     rows, missing, used = [], 0, set()
+    printed, sheet = set(), 0        # 同一个 MBL 的分单共用一张纸, 跟第一叠一个规则
 
-    for i, (hbl, mbl) in enumerate(order, 1):
-        p = by_mbl.get(core_mbl(mbl))
+    for hbl, mbl in order:
+        core = core_mbl(mbl)
+        dup = core in printed        # 这个 MBL 前面已经出过纸了
+        if dup:
+            sheet_no = ""
+        else:
+            printed.add(core)
+            sheet += 1
+            sheet_no = sheet
+
+        p = by_mbl.get(core)
         if p is None:
             missing += 1
-            if writer is not None:
+            if writer is not None and not dup:
                 writer.add_blank_page(width=612, height=792)   # Letter 空白占位
-            rows.append({"第几张纸": i, "HBL": hbl, "MBL": mbl, "文件": "",
+            rows.append({"第几张纸": sheet_no, "HBL": hbl, "MBL": mbl, "文件": "",
                          "运输方式": "", "目的地": "", "ETA": "",
                          "柜数": 0, "柜号": "", "封条": "", "柜型": "",
                          "件数": "", "重量": "", "材积": "",
-                         "状态": "缺 Pre-Arrival,已插空白纸占位"})
+                         "状态": "缺 Pre-Arrival,已插空白纸占位", "DupRow": dup})
             continue
-        used.add(core_mbl(mbl))
-        _, npages, hbl_in_pdf, cons, mode, dest, eta = meta[core_mbl(mbl)]
+        used.add(core)
+        _, npages, hbl_in_pdf, cons, mode, dest, eta = meta[core]
         take = [x for x in TAKE_PAGES if x <= npages]
-        if writer is not None:
+        if writer is not None and not dup:
             r = PdfReader(str(p))
             for x in take:
                 writer.add_page(r.pages[x - 1])
@@ -473,13 +493,15 @@ def main():
             note = "这个 PDF 是空的"
         if not cons:
             note = (note + " / " if note else "") + "柜信息读不出来"
-        rows.append({"第几张纸": i, "HBL": hbl, "MBL": mbl, "文件": p.name,
+        if dup:
+            note = (note + " / " if note else "") + "同 MBL 的分单, 跟上一行共用一张纸"
+        rows.append({"第几张纸": sheet_no, "HBL": hbl, "MBL": mbl, "文件": p.name,
                      "运输方式": mode, "目的地": dest, "ETA": eta,
                      "柜数": len(cons),
                      "柜号": join_col(cons, 0), "封条": join_col(cons, 1),
                      "柜型": join_col(cons, 2), "件数": join_col(cons, 3),
                      "重量": join_col(cons, 4), "材积": join_col(cons, 5),
-                     "状态": note or "正常"})
+                     "状态": note or "正常", "DupRow": dup})
 
     extras = [m for m in by_mbl if m not in used]
 

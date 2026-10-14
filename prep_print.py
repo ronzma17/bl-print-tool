@@ -469,6 +469,7 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     YELLOW = PatternFill("solid", fgColor="FFF2CC")   # Notify 公司名跟 Consignee 不同
     HEAD   = PatternFill("solid", fgColor="DDEBF7")
     RED    = Font(color="C00000", bold=True)   # Ramp
+    VIOLET = Font(color="7E57C2", bold=True)   # 跟上一行共用一张纸的分单
     BLUEFILL = PatternFill("solid", fgColor="DDEBF7")   # 起始港跟大多数不一样
     LILAC    = PatternFill("solid", fgColor="EDE7F6")   # 这一行有问题, 整行淡紫
 
@@ -491,6 +492,9 @@ def write_s1_report(out_dir, rows, problems, man_lines):
         if str(r.get("运输方式", "")).lower() == "ramp":
             for c in range(1, len(headers) + 1):
                 ws.cell(i, c).font = RED
+        if r.get("DupRow"):     # 不占纸的分单行 -> 淡紫字, 压过 Ramp 的红字
+            for c in range(1, len(headers) + 1):
+                ws.cell(i, c).font = VIOLET
         if r.get("PolOdd"):
             for c in range(1, len(headers) + 1):
                 ws.cell(i, c).fill = BLUEFILL
@@ -534,6 +538,9 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     odd  = sum(1 for r in rows if r.get("柜型") and
                any(x.strip().upper() != "40HC" for x in str(r["柜型"]).split(",")))
     ndiff  = sum(1 for r in rows if r.get("NotifyDiff") or r.get("NotifyAddrDiff"))
+    ndup = sum(1 for r in rows if r.get("DupRow"))
+    if ndup:
+        print(f"  同 MBL 的分单 {ndup} 行 -> 不单独占纸, 第几张纸留空 + 淡紫字")
     nissue = sum(1 for r in rows if r.get("Issue"))
     if nissue:
         print(f"  有问题需要看的 {nissue} 票 -> 整行淡紫, 详见状态列")
@@ -834,6 +841,7 @@ def main():
     batches = ([matched] if args.chunk <= 0
                else [matched[i:i + args.chunk] for i in range(0, len(matched), args.chunk)])
 
+    printed = set()     # 已经出过纸的 MBL
     for bi, batch in enumerate(batches, 1):
         writer = None if args.dry_run else PdfWriter()
         sheet = 0
@@ -843,24 +851,32 @@ def main():
             take = [i for i in WAYBILL_PAGES if i <= nwb]
             total = max(nbl, 1) + max(len(take), 1)      # 缺哪面就用一张白页顶上
             pad = 1 if total % 2 else 0
-            if writer is not None:
-                if bl:
-                    for pg in PdfReader(str(bl)).pages:
-                        writer.add_page(pg)
-                else:
-                    writer.add_blank_page(width=612, height=792)
-                if wb and take:
-                    wbr = PdfReader(str(wb))
-                    for i in take:
-                        writer.add_page(wbr.pages[i - 1])
-                else:
-                    writer.add_blank_page(width=612, height=792)
-                if pad:
-                    last = writer.pages[-1]
-                    writer.add_blank_page(width=last.mediabox.width,
-                                          height=last.mediabox.height)
-            start_sheet = sheet + 1
-            sheet += (total + pad) // 2
+            # 同一个 MBL 下的几个分单是同一票货(同柜同封条), 只出一张纸。
+            # 后面的分单照样在明细里占一行, 只是「第几张纸」留空 —— 两叠纸都按
+            # 这个规则走, 张数才对得上。
+            dup = key in printed
+            if dup:
+                start_sheet = ""
+            else:
+                printed.add(key)
+                if writer is not None:
+                    if bl:
+                        for pg in PdfReader(str(bl)).pages:
+                            writer.add_page(pg)
+                    else:
+                        writer.add_blank_page(width=612, height=792)
+                    if wb and take:
+                        wbr = PdfReader(str(wb))
+                        for i in take:
+                            writer.add_page(wbr.pages[i - 1])
+                    else:
+                        writer.add_blank_page(width=612, height=792)
+                    if pad:
+                        last = writer.pages[-1]
+                        writer.add_blank_page(width=last.mediabox.width,
+                                              height=last.mediabox.height)
+                start_sheet = sheet + 1
+                sheet += (total + pad) // 2
             # 这一行要说的话。hard=True 是真的数据问题 —— 明细里整行标淡紫,
             # 提醒人去看。hard=False 是提示: 起始港有蓝底、Notify 有黄格,
             # 已经各自标过了, 再把整行也染上反而看不出哪几行真的要处理。
@@ -877,8 +893,9 @@ def main():
                 say("没有 Waybill, 反面是白页")
             elif nwb < max(WAYBILL_PAGES):
                 say(f"Waybill 只有 {nwb} 页")
-            if wb and mbl_rows[key] > 1:
-                say(f"同一个 MBL 下有 {mbl_rows[key]} 票分单, 共用这一份 Waybill")
+            if mbl_rows[key] > 1:
+                say(f"同一个 MBL 下有 {mbl_rows[key]} 个分单, 共用一张纸"
+                    + ("(本行不单独占纸)" if dup else ""))
 
             info = pick_manifest(man_info.get(key, []), hbl)
             # HBL 用舱单上的托单编号(带 AIC 前缀), 舱单里没有就退回文件名里的号
@@ -967,6 +984,7 @@ def main():
                 "PolOdd": pol_odd,
                 "状态": note or "正常",
                 "Issue": issue,
+                "DupRow": dup,
                 "第几张纸": start_sheet, "批次": bi,
                 "文件包": info.get("文件包", ""), "备注": info.get("备注", ""),
                 "BL文件": bl.name if bl else "", "Waybill文件": wb.name if wb else "",
