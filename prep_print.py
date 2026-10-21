@@ -663,7 +663,16 @@ def waybill_only(src: Path, out_dir: Path):
         name = "PRINT_WAYBILL.pdf" if len(groups) == 1 else f"PRINT_WAYBILL_{int(b):02d}.pdf"
         with open(writable_path(out_dir / name), "wb") as fh:
             writer.write(fh)
+        # 倒序版: 打印机出纸有的是正面朝上、有的朝下, 拿到手的那摞纸可能是倒过来的。
+        # 原样放回纸盒时该用哪一版, 试两张就知道了。
+        rev = PdfWriter()
+        for i in range(len(writer.pages) - 1, -1, -1):
+            rev.add_page(writer.pages[i])
+        rname = name.replace(".pdf", "_REVERSE.pdf")
+        with open(writable_path(out_dir / rname), "wb") as fh:
+            rev.write(fh)
         print(f"  {name}: {len(writer.pages)} 页 = {len(writer.pages)} 张纸 (单面打印)")
+        print(f"  {rname}: 同样内容, 倒着排")
 
     extras = [m for m in wb_items if m not in {x[2] for x in order}]
     if extras:
@@ -698,6 +707,9 @@ def waybill_only(src: Path, out_dir: Path):
         pass
 
     print("\n打印设置: 【单面】打印, 不要勾双面。把第一叠纸翻面放回纸盒再打。")
+    print("          那摞纸最上面是第 1 张 -> 用 PRINT_WAYBILL.pdf")
+    print("          最上面是最后一张     -> 用 _REVERSE 那版")
+    print("          拿 2 张试一次就知道, 别整叠直接上。")
 
 
 def is_output_file(f: Path) -> bool:
