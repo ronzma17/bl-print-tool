@@ -258,6 +258,28 @@ SIZE_X    = re.compile(r"^(\d+)\s*[xX]\s*(\d{2}[A-Z]{2})$")   # 1X40HC / 2X40HC
 
 
 
+# 数字跟单位粘成一个词的情况: '68.000CBM' / 'CBM 68.000' / '1,234 CBM'
+CBM_BEFORE = re.compile(r"([\d,]+(?:\.\d+)?)\s*CBM\b", re.I)
+CBM_AFTER  = re.compile(r"\bCBM[:\s]*([\d,]+(?:\.\d+)?)", re.I)
+KGS_BEFORE = re.compile(r"([\d,]+(?:\.\d+)?)\s*KGS?\b", re.I)
+KGS_AFTER  = re.compile(r"\bKGS?[:\s]*([\d,]+(?:\.\d+)?)", re.I)
+
+
+def near_unit(items, before, after) -> str:
+    """从所有文字里找紧挨着单位的那个数。
+
+       正常情况材积单独落在坐标 0, 上面的办法够用了。但有的 B/L 把数字和单位
+       排成一个词('68.000CBM'), pypdf 就当一段文字给出来, 按坐标怎么找都找不到
+       —— 这时候只能认单位本身。
+    """
+    for y, x, t in items:
+        for rx in (before, after):
+            m = rx.search(t)
+            if m:
+                return m.group(1)
+    return ""
+
+
 def total_of(val, parts: int = 0) -> float | None:
     """加总货量值, 好让 Waybill 的分柜值跟 B/L 的合计数能比。
 
@@ -284,12 +306,13 @@ def total_of(val, parts: int = 0) -> float | None:
 def parse_hbl_cargo(path: Path):
     """没有 Waybill 时, 从 Transport B/L 上抠柜号/封条/柜型/件数/重量/材积。
 
-       B/L 的货物信息是靠坐标摆位的, 没有可搜的标签:
-         y 700~760  x 119 柜号, x 216 封条, x 307 柜型(只在第一行, 形如 2X40HC)
-         y 495~510  x 171 件数, 后面跟 CARTON(CTN)
-         y 505~545  x 592 重量
-       还有个坑: 封条、重量、材积有时会掉到坐标 (0,0) 去 —— 同一批文件里
-       有的掉有的不掉, 所以这些得按内容长相认, 不能只认位置。
+       B/L 的货物信息是靠坐标摆位的, 没有可搜的标签, 而承运人至少在用两套模板,
+       同样的字段能差出十几个点来(柜号 y=702.7 对 y=687.5)。所以这里尽量
+       不写死坐标: 件数认旁边的 CARTON(CTN), 材积认重量右边那一列,
+       柜号靠「4 个字母 + 7 位数字」这个格式本身认。
+
+       还有个坑: 封条、重量、材积有时会掉到坐标 (0,0) 去, 同一批里有的掉有的
+       不掉, 所以这些得按内容长相认, 不能只认位置。
 
        注意 B/L 上的件数/重量/材积是【整票合计】, 不像 Waybill 那样分柜列,
        所以多柜时这三项只有一个合计数。
@@ -309,18 +332,21 @@ def parse_hbl_cargo(path: Path):
 
     zeros = [t for y, x, t in items if y == 0.0 and x == 0.0]
 
-    # ---- 柜号, 按从上到下 ----
+    # ---- 柜号: 靠格式认, 不靠位置。只把窗口放宽到上半页, 躲开下面的货描和地址 ----
     cnos = sorted((y, x, t) for y, x, t in items
-                  if 690 < y < 770 and 90 < x < 200 and CONTAINER_PATTERN.fullmatch(t))
+                  if y > 600 and x < 300 and CONTAINER_PATTERN.fullmatch(t))
+    if not cnos:
+        cnos = [(0.0, 0.0, t) for t in zeros if CONTAINER_PATTERN.fullmatch(t)]
     if not cnos:
         return {}
 
-    # ---- 封条: 先找跟柜号同一行的, 不够再从坐标 0 里按顺序补 ----
+    # ---- 封条: 先找跟柜号同一行、在柜号右边的; 不够再从坐标 0 里按顺序补 ----
     spare = [t for t in zeros if SEAL_LIKE.fullmatch(t)]
     seals = []
-    for y, _, _ in cnos:
+    for cy, cx, _ in cnos:
         hit = next((t for yy, xx, t in items
-                    if abs(yy - y) < 4 and 200 < xx < 290 and SEAL_LIKE.fullmatch(t)), "")
+                    if cy and abs(yy - cy) < 4 and xx > cx + 15 and xx < 320
+                    and SEAL_LIKE.fullmatch(t)), "")
         if not hit and spare:
             hit = spare.pop(0)
         seals.append(hit)
@@ -328,33 +354,56 @@ def parse_hbl_cargo(path: Path):
     # ---- 柜型: 1X40HC 这种, 数量乘上去摊到每个柜 ----
     sizes = []
     m = next((SIZE_X.match(t) for y, x, t in items
-              if 690 < y < 770 and 280 < x < 380 and SIZE_X.match(t)), None)
+              if y > 600 and 280 < x < 380 and SIZE_X.match(t)), None)
     if m:
         # B/L 爱写 45HQ, Waybill 写 45HC, 同一种柜型两个写法, 统一掉
         one = m.group(2).upper().replace("HQ", "HC")
         sizes = [one] * max(int(m.group(1)), len(cnos))
     sizes = (sizes + [""] * len(cnos))[:len(cnos)]
 
-    # ---- 件数: CARTON 左边那个数 ----
+    # ---- 件数: 认结构, 不认单位词 ----
+    # 「NO AND KIND OF PACKAGES」那一栏里, 件数后面紧跟着计量单位。
+    # 但单位五花八门 —— CARTON(CTN)、PACKAGES、PCS、BAGS、ROLLS... 列不完,
+    # 所以不去认单位是哪个词, 只认「一个纯数字, 右边同一行紧跟着一个单词」
+    # 这个形状。换成什么单位都抓得到。
     qty = ""
     for y, x, t in items:
-        if 490 < y < 515 and 140 < x < 200 and t.replace(",", "").isdigit():
+        if not (400 < y < 620 and 140 < x < 270):
+            continue
+        if not t.replace(",", "").isdigit():
+            continue
+        unit = next((u for yy, xx, u in items
+                     if abs(yy - y) < 7 and x < xx < 300 and u[:1].isalpha()), None)
+        if unit:
             qty = t
             break
 
-    # ---- 重量: 先找正常位置; 掉到坐标 0 的话, 跟材积一起在那儿 ----
-    weight = next((t for y, x, t in items
-                   if 495 < y < 550 and x > 550 and NUM_DOT.fullmatch(t)), "")
+    # ---- 重量和材积 ----
+    # 这两个数并排放在右边, 重量在左、材积在右。一套模板两个都印在页面上,
+    # 另一套把材积(有时连重量)甩到坐标 0 去, 所以两头都得看。
+    right = sorted((x, t) for y, x, t in items
+                   if 480 < y < 560 and x > 550 and NUM_DOT.fullmatch(t))
     nums = [t for t in zeros if NUM_DOT.fullmatch(t)]
-    if weight:
+    if len(right) >= 2:
+        weight, meas = right[0][1], right[1][1]
+    elif len(right) == 1:
+        weight = right[0][1]
         meas = nums[0] if nums else ""
     elif len(nums) >= 2:
         # 两个都掉下来了 —— 重量按 KGS 算, 材积按 CBM 算, 一个柜的重量
         # 总是比材积大一个数量级, 拿大小分得开
-        a, b = sorted(nums, key=lambda v: float(v.replace(",", "")))
-        meas, weight = a, b
+        lo, hi = sorted(nums, key=lambda v: float(v.replace(",", "")))[:2]
+        weight, meas = hi, lo
     else:
-        meas = nums[0] if nums else ""
+        weight, meas = "", (nums[0] if nums else "")
+
+    # 还没拿到就认单位标签, 再兜一道整数 —— 正则本来要求带小数点, 整整 68 会漏
+    if not meas:
+        meas = near_unit(items, CBM_BEFORE, CBM_AFTER)
+    if not meas:
+        meas = next((t for t in zeros if t.replace(",", "").isdigit()), "")
+    if not weight:
+        weight = near_unit(items, KGS_BEFORE, KGS_AFTER)
 
     return {
         "柜数": str(len(cnos)),
