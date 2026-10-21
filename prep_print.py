@@ -561,6 +561,145 @@ def write_s1_report(out_dir, rows, problems, man_lines):
     return path
 
 
+def strip_scac(v: str) -> str:
+    """报告里的 MBL 带船公司前缀(CMDUCHN4078234), 文件名是裸号(CHN4078234)"""
+    v = (v or "").strip().upper()
+    if v.startswith(SCAC) and KEY_PATTERN.fullmatch(v[len(SCAC):]):
+        return v[len(SCAC):]
+    return v
+
+
+def waybill_only(src: Path, out_dir: Path):
+    """补打 Waybill 模式。
+
+    一批货常常先来 HBL, Waybill 过几天才到。那时候照常跑一次正常模式,
+    PRINT.pdf 的反面全是空白页 —— 打印机会走纸但不喷粉, 所以纸的张数、
+    顺序、正面内容都已经定下来了, 只差反面。
+
+    Waybill 到了之后跑这个模式, 出一个【单面】PDF, 把那叠纸翻过来塞回
+    打印机就能把反面补上。顺序严格照 _报告.xlsx 走, 缺的插空白页 ——
+    少一页整叠就从那里开始错位, 这是整件事里最要命的地方。
+    """
+    report = out_dir / "_报告.xlsx"
+    if not report.exists():
+        print(f"找不到 {report.name} —— 先跑一次正常模式(菜单 2 或 3), 再来补 Waybill")
+        return
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        print("  ! 缺少 openpyxl, 请执行  pip install openpyxl")
+        return
+
+    ws = load_workbook(str(report), read_only=True, data_only=True)["明细"]
+    it = ws.iter_rows(values_only=True)
+    head = [("" if v is None else str(v)).strip() for v in next(it)]
+    try:
+        im, isheet, ibatch = head.index("MBL"), head.index("第几张纸"), head.index("批次")
+    except ValueError:
+        print("  ! 报告里找不到 MBL / 第几张纸 / 批次 这几列, 版本对不上")
+        return
+
+    order = []          # [(批次, 第几张纸, 裸MBL)]
+    for row in it:
+        mbl = ("" if im >= len(row) or row[im] is None else str(row[im])).strip()
+        if not mbl:
+            break
+        sheet = row[isheet] if isheet < len(row) else None
+        if sheet in (None, ""):      # 同 MBL 的分单行, 不单独占纸
+            continue
+        batch = row[ibatch] if ibatch < len(row) else 1
+        order.append((batch, sheet, strip_scac(mbl)))
+
+    if not order:
+        print("  ! 报告里没读到任何占纸的行")
+        return
+
+    # 扫输入文件夹, 只认 Waybill(文件名里只有提单号, 后面不带 HBL 号)
+    wb_items = {}
+    for p in sorted(src.glob("*.pdf")):
+        key, k_name, _ = kind_by_name(p)
+        if not key:
+            continue
+        npages, txt = read_pdf(p)
+        kind = k_name or kind_by_text(txt)
+        if kind != "wb":
+            continue
+        if key in wb_items:
+            print(f"  ! {key} 有两份 Waybill, 用了先读到的那份")
+            continue
+        wb_items[key] = (p, npages)
+
+    print(f"第一叠共 {len(order)} 张纸 | 这次找到 {len(wb_items)} 份 Waybill\n")
+
+    groups = {}
+    for b, sheet, mbl in order:
+        groups.setdefault(b, []).append((sheet, mbl))
+
+    rows, missing = [], 0
+    for b in sorted(groups):
+        writer = PdfWriter()
+        for sheet, mbl in groups[b]:
+            item = wb_items.get(mbl)
+            if item:
+                p, npages = item
+                take = [i for i in WAYBILL_PAGES if i <= npages]
+                if take:
+                    r = PdfReader(str(p))
+                    for i in take:
+                        writer.add_page(r.pages[i - 1])
+                    note = "正常"
+                else:
+                    writer.add_blank_page(width=612, height=792)
+                    note = "这份 Waybill 是空的, 插了白页"
+                    missing += 1
+            else:
+                writer.add_blank_page(width=612, height=792)
+                note = "还没收到 Waybill, 插了白页"
+                missing += 1
+            rows.append({"批次": b, "第几张纸": sheet, "MBL": mbl,
+                         "文件": item[0].name if item else "", "状态": note})
+
+        name = "PRINT_WAYBILL.pdf" if len(groups) == 1 else f"PRINT_WAYBILL_{int(b):02d}.pdf"
+        with open(writable_path(out_dir / name), "wb") as fh:
+            writer.write(fh)
+        print(f"  {name}: {len(writer.pages)} 页 = {len(writer.pages)} 张纸 (单面打印)")
+
+    extras = [m for m in wb_items if m not in {x[2] for x in order}]
+    if extras:
+        print(f"  ! 有 {len(extras)} 份 Waybill 在第一叠里找不到对应的票, 没有放进去:")
+        for m in sorted(extras):
+            print(f"       {m}")
+
+    print(f"\n  补上 {len(order) - missing} 张 | 还缺 {missing} 张(插了白页占位)")
+
+    # 小报告: 哪几张是空白
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        wb = Workbook(); w = wb.active; w.title = "补打Waybill"
+        w.append(["批次", "第几张纸", "MBL", "文件", "状态"])
+        for c in range(1, 6):
+            w.cell(1, c).font = Font(bold=True)
+            w.cell(1, c).fill = PatternFill("solid", fgColor="DDEBF7")
+        RED = PatternFill("solid", fgColor="FFC7CE")
+        for r in rows:
+            w.append([r["批次"], r["第几张纸"], r["MBL"], r["文件"], r["状态"]])
+            if r["状态"] != "正常":
+                for c in range(1, 6):
+                    w.cell(w.max_row, c).fill = RED
+        w.freeze_panes = "A2"
+        for c, wd in ((1, 8), (2, 10), (3, 18), (4, 34), (5, 30)):
+            w.column_dimensions[chr(64 + c)].width = wd
+        path = writable_path(out_dir / "_报告_补打Waybill.xlsx")
+        wb.save(path)
+        print(f"报告: {path}")
+    except ImportError:
+        pass
+
+    print("\n打印设置: 【单面】打印, 不要勾双面。把第一叠纸翻面放回纸盒再打。")
+
+
 def is_output_file(f: Path) -> bool:
     return f.is_file() and (f.name.startswith(OUT_PREFIX) or f.name in EXTRA_OUT)
 
@@ -700,6 +839,8 @@ def main():
     ap.add_argument("--chunk", type=int, default=0, help="每个输出文件放几票, 0=不拆")
     ap.add_argument("--manifest", default=None,
                     help="船公司舱单 xls/xlsx/csv, 跑完自动核对缺哪几票")
+    ap.add_argument("--waybill-only", action="store_true",
+                    help="补打 Waybill: 只出反面那一叠, 顺序照 _报告.xlsx 走")
     ap.add_argument("--dry-run", action="store_true", help="只检查, 什么都不动")
     args = ap.parse_args()
 
@@ -711,6 +852,13 @@ def main():
     arc = Path(args.archive) if args.archive else None
     if arc:
         arc.mkdir(parents=True, exist_ok=True)
+
+    if args.waybill_only:
+        unzip_all(src)
+        waybill_only(src, out_dir)
+        if arc:
+            archive_sources(src, arc)
+        return
 
     if not args.dry_run:
         archive_old_output(out_dir, arc)

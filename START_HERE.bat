@@ -10,7 +10,6 @@ set "INBOX=%BASE%1_DROP_ZIPS_HERE"
 set "OUTBOX=%BASE%2_READY_TO_PRINT"
 set "ARCHIVE=%BASE%3_ARCHIVE"
 set "PABOX=%BASE%4_DROP_PREARRIVAL_HERE"
-REM report is auto-detected inside 2_READY_TO_PRINT
 
 if not exist "%INBOX%"   mkdir "%INBOX%"
 if not exist "%OUTBOX%"  mkdir "%OUTBOX%"
@@ -37,6 +36,12 @@ echo.
 echo      4 = CHECK ONLY
 echo      5 = MAKE PDF
 echo.
+echo   CATCH-UP   Waybill arrived later   (SINGLE SIDE)
+echo     put the waybill zip into  1_DROP_ZIPS_HERE
+echo     prints the BACK of sheet 1, same order
+echo.
+echo      6 = MAKE WAYBILL PDF
+echo.
 echo      0 = open the folders
 echo.
 set /p MODE=   Type a number then Enter: 
@@ -48,6 +53,7 @@ if "%MODE%"=="2" goto mode2
 if "%MODE%"=="3" goto mode3
 if "%MODE%"=="4" goto mode4
 if "%MODE%"=="5" goto mode5
+if "%MODE%"=="6" goto mode6
 echo   Invalid choice.
 goto theend
 
@@ -73,12 +79,17 @@ if not exist "%S2%" goto noscript2
 python "%S2%" "%PABOX%" --out "%OUTBOX%" --archive "%ARCHIVE%"
 goto finished
 
+:mode6
+python "%S1%" "%INBOX%" --out "%OUTBOX%" --archive "%ARCHIVE%" --waybill-only
+goto finished
+
 :finished
 echo.
 echo ==========================================
 echo   Done.  Open 2_READY_TO_PRINT and print.
-echo   PRINT.pdf         duplex, flip LONG edge
-echo   PRINT_SHEET2.pdf  SINGLE side
+echo   PRINT.pdf           duplex, flip LONG edge
+echo   PRINT_SHEET2.pdf    SINGLE side
+echo   PRINT_WAYBILL.pdf   SINGLE side, paper flipped
 echo ==========================================
 echo.
 start "" "%OUTBOX%"
