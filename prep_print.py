@@ -252,6 +252,122 @@ def check_hbl(party, nblocks):
     return bad
 
 
+SEAL_LIKE = re.compile(r"^[A-Z]{1,2}\d{6,9}$")       # 封条 R9032062 / J1420110
+NUM_DOT   = re.compile(r"^[\d,]+\.\d+$")             # 带小数点的数 68.000 / 16744.000
+SIZE_X    = re.compile(r"^(\d+)\s*[xX]\s*(\d{2}[A-Z]{2})$")   # 1X40HC / 2X40HC
+
+
+
+def total_of(val, parts: int = 0) -> float | None:
+    """加总货量值, 好让 Waybill 的分柜值跟 B/L 的合计数能比。
+
+       逗号有两个意思, 字面上分不开 —— '520,520' 可能是两个柜各 520,
+       也可能是千分位的 520520。所以拿柜数来定: 段数正好等于柜数就按分柜加总,
+       否则当千分位。认不出来返回 None, 调用方跳过不比。
+    """
+    if not val:
+        return None
+    chunks = [c.strip() for c in str(val).split(",") if c.strip()]
+    if not chunks:
+        return None
+    if parts > 1 and len(chunks) != parts:
+        chunks = ["".join(chunks)]        # 千分位, 拼回去
+    elif parts <= 1:
+        chunks = ["".join(chunks)]
+    try:
+        return sum(float(c) for c in chunks)
+    except ValueError:
+        return None
+
+
+
+def parse_hbl_cargo(path: Path):
+    """没有 Waybill 时, 从 Transport B/L 上抠柜号/封条/柜型/件数/重量/材积。
+
+       B/L 的货物信息是靠坐标摆位的, 没有可搜的标签:
+         y 700~760  x 119 柜号, x 216 封条, x 307 柜型(只在第一行, 形如 2X40HC)
+         y 495~510  x 171 件数, 后面跟 CARTON(CTN)
+         y 505~545  x 592 重量
+       还有个坑: 封条、重量、材积有时会掉到坐标 (0,0) 去 —— 同一批文件里
+       有的掉有的不掉, 所以这些得按内容长相认, 不能只认位置。
+
+       注意 B/L 上的件数/重量/材积是【整票合计】, 不像 Waybill 那样分柜列,
+       所以多柜时这三项只有一个合计数。
+    """
+    try:
+        items = []
+
+        def v(t, cm, tm, fd, fs):
+            if t and t.strip():
+                items.append((round(tm[5], 1), round(tm[4], 1), t.strip()))
+
+        PdfReader(str(path)).pages[0].extract_text(visitor_text=v)
+    except Exception:
+        return {}
+    if not items:
+        return {}
+
+    zeros = [t for y, x, t in items if y == 0.0 and x == 0.0]
+
+    # ---- 柜号, 按从上到下 ----
+    cnos = sorted((y, x, t) for y, x, t in items
+                  if 690 < y < 770 and 90 < x < 200 and CONTAINER_PATTERN.fullmatch(t))
+    if not cnos:
+        return {}
+
+    # ---- 封条: 先找跟柜号同一行的, 不够再从坐标 0 里按顺序补 ----
+    spare = [t for t in zeros if SEAL_LIKE.fullmatch(t)]
+    seals = []
+    for y, _, _ in cnos:
+        hit = next((t for yy, xx, t in items
+                    if abs(yy - y) < 4 and 200 < xx < 290 and SEAL_LIKE.fullmatch(t)), "")
+        if not hit and spare:
+            hit = spare.pop(0)
+        seals.append(hit)
+
+    # ---- 柜型: 1X40HC 这种, 数量乘上去摊到每个柜 ----
+    sizes = []
+    m = next((SIZE_X.match(t) for y, x, t in items
+              if 690 < y < 770 and 280 < x < 380 and SIZE_X.match(t)), None)
+    if m:
+        # B/L 爱写 45HQ, Waybill 写 45HC, 同一种柜型两个写法, 统一掉
+        one = m.group(2).upper().replace("HQ", "HC")
+        sizes = [one] * max(int(m.group(1)), len(cnos))
+    sizes = (sizes + [""] * len(cnos))[:len(cnos)]
+
+    # ---- 件数: CARTON 左边那个数 ----
+    qty = ""
+    for y, x, t in items:
+        if 490 < y < 515 and 140 < x < 200 and t.replace(",", "").isdigit():
+            qty = t
+            break
+
+    # ---- 重量: 先找正常位置; 掉到坐标 0 的话, 跟材积一起在那儿 ----
+    weight = next((t for y, x, t in items
+                   if 495 < y < 550 and x > 550 and NUM_DOT.fullmatch(t)), "")
+    nums = [t for t in zeros if NUM_DOT.fullmatch(t)]
+    if weight:
+        meas = nums[0] if nums else ""
+    elif len(nums) >= 2:
+        # 两个都掉下来了 —— 重量按 KGS 算, 材积按 CBM 算, 一个柜的重量
+        # 总是比材积大一个数量级, 拿大小分得开
+        a, b = sorted(nums, key=lambda v: float(v.replace(",", "")))
+        meas, weight = a, b
+    else:
+        meas = nums[0] if nums else ""
+
+    return {
+        "柜数": str(len(cnos)),
+        "柜号": ",".join(t for _, _, t in cnos),
+        "封条": ",".join(seals),
+        "柜型": ",".join(sizes),
+        "件数": qty,
+        "重量": weight,
+        "材积": meas,
+        "_来源": "B/L",
+    }
+
+
 def parse_waybill(path: Path):
     """从 Waybill 第 1 页抠货物信息。
        版面长这样:
@@ -1001,6 +1117,12 @@ def main():
     batches = ([matched] if args.chunk <= 0
                else [matched[i:i + args.chunk] for i in range(0, len(matched), args.chunk)])
 
+    # Waybill 整批都还没到是常事(先凭 HBL 做, 等 Waybill 来了跑菜单 6 补打反面)。
+    # 那种情况下每一行都标「缺 Waybill」等于谁都没标, 明细就看不出哪几行真要处理了。
+    # 所以只在缺的是少数时才当问题 —— 一整批里漏一两票才是该盯的。
+    lack_wb = sum(1 for _, _, _, wbp in matched if not wbp)
+    wb_lack_is_normal = lack_wb > len(matched) / 2 if matched else False
+
     printed = set()     # 已经出过纸的 MBL
     for bi, batch in enumerate(batches, 1):
         writer = None if args.dry_run else PdfWriter()
@@ -1050,7 +1172,7 @@ def main():
             elif nbl != 1:
                 say(f"B/L 有 {nbl} 页, 正反面可能错位")
             if not wb:
-                say("没有 Waybill, 反面是白页")
+                say("没有 Waybill, 反面是白页", not wb_lack_is_normal)
             elif nwb < max(WAYBILL_PAGES):
                 say(f"Waybill 只有 {nwb} 页")
             if mbl_rows[key] > 1:
@@ -1093,8 +1215,26 @@ def main():
                     say(w)
 
             cargo = parse_waybill(wb) if wb else {}
+            if not cargo and bl:
+                # Waybill 还没到的时候, B/L 上这些信息也是全的, 先拿来顶上
+                cargo = parse_hbl_cargo(bl)
+                if cargo:
+                    # 只是说明数据来源, 不是要处理的问题, 别染整行
+                    say("柜号/重量等来自 B/L(Waybill 还没到), 多柜时这几项是合计数", False)
             if wb and not cargo:
                 say("Waybill 货物信息读不出来")
+            elif wb and cargo and bl:
+                # Waybill 是分柜列的, B/L 是整票合计, 加总再比。
+                # 对不上说明签发之后改过单而两份没同步 —— 以 Waybill 为准, 但要提出来
+                ref = parse_hbl_cargo(bl)
+                try:
+                    n = int(cargo.get("柜数") or 0)
+                except ValueError:
+                    n = 0
+                for fld, label in (("件数", "件数"), ("重量", "重量")):
+                    a, b = total_of(cargo.get(fld), n), total_of(ref.get(fld))
+                    if a is not None and b is not None and abs(a - b) > 0.5:
+                        say(f"B/L 跟 Waybill 的{label}不一致: B/L {b:g} / Waybill {a:g}")
             elif cargo:     # 压根没有 Waybill 时上面已经说过了, 别再报一次柜数对不上
                 # 跟舱单的箱型箱量对一下, 多柜最容易在这里出岔子
                 want_n = info.get("柜数舱单", "")
