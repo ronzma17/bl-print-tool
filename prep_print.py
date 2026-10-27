@@ -954,6 +954,27 @@ def unzip_all(folder: Path):
     print(f"解压 {len(zips)} 个 zip,释放 {n} 个新 PDF")
 
 
+
+def add_pages(writer, path: Path, pick=None) -> bool:
+    """把 path 的页子搬进 writer。pick 是要哪几页(从 1 数), 不给就全要。
+
+       成功返回 True。中途出错的话, 把这次已经搬进去的页子退掉, 补一张白页,
+       返回 False —— 让调用方知道这面没成, 但纸张数照样对得上。
+    """
+    before = len(writer.pages)
+    try:
+        r = PdfReader(str(path))
+        for pg in ([r.pages[i - 1] for i in pick] if pick else r.pages):
+            writer.add_page(pg)
+        return True
+    except Exception as e:
+        print(f"  ! 搬页子出错 {path.name}: {e}")
+        while len(writer.pages) > before:
+            del writer.pages[-1]
+        writer.add_blank_page(width=612, height=792)
+        return False
+
+
 def read_pdf(path: Path):
     try:
         r = PdfReader(str(path))
@@ -1182,6 +1203,15 @@ def main():
             take = [i for i in WAYBILL_PAGES if i <= nwb]
             total = max(nbl, 1) + max(len(take), 1)      # 缺哪面就用一张白页顶上
             pad = 1 if total % 2 else 0
+            # 这一票要说的话。hard=True 是真的数据问题 —— 明细里整行标淡紫,
+            # 提醒人去看。hard=False 是提示: 起始港有蓝底、Notify 有黄格,
+            # 已经各自标过了, 再把整行也染上反而看不出哪几行真的要处理。
+            # 定义放在排版之前, 因为搬页子出错也要能记一条。
+            msgs = []
+
+            def say(m, hard=True):
+                msgs.append((m, hard))
+
             # 同一个 MBL 下的几个分单是同一票货(同柜同封条), 只出一张纸。
             # 后面的分单照样在明细里占一行, 只是「第几张纸」留空 —— 两叠纸都按
             # 这个规则走, 张数才对得上。
@@ -1191,16 +1221,17 @@ def main():
             else:
                 printed.add(key)
                 if writer is not None:
-                    if bl:
-                        for pg in PdfReader(str(bl)).pages:
-                            writer.add_page(pg)
-                    else:
+                    # nbl/nwb 是前面 read_pdf 验过的页数, 0 就是这文件读不了
+                    # (0 字节、下载断了、损坏)。这里再 try 一层是防另一种情况:
+                    # 页数读得出来, 但某一页的内容是坏的, 复制到一半才炸 ——
+                    # 一票坏文件不能让整批 86 票都出不来, 缺的那面照常补白页。
+                    if bl and nbl and not add_pages(writer, bl):
+                        say("Transport B/L 复制到一半出错, 正面用了白页")
+                    elif not (bl and nbl):
                         writer.add_blank_page(width=612, height=792)
-                    if wb and take:
-                        wbr = PdfReader(str(wb))
-                        for i in take:
-                            writer.add_page(wbr.pages[i - 1])
-                    else:
+                    if wb and take and not add_pages(writer, wb, take):
+                        say("Waybill 复制到一半出错, 反面用了白页")
+                    elif not (wb and take):
                         writer.add_blank_page(width=612, height=792)
                     if pad:
                         last = writer.pages[-1]
@@ -1208,16 +1239,10 @@ def main():
                                               height=last.mediabox.height)
                 start_sheet = sheet + 1
                 sheet += (total + pad) // 2
-            # 这一行要说的话。hard=True 是真的数据问题 —— 明细里整行标淡紫,
-            # 提醒人去看。hard=False 是提示: 起始港有蓝底、Notify 有黄格,
-            # 已经各自标过了, 再把整行也染上反而看不出哪几行真的要处理。
-            msgs = []
-
-            def say(m, hard=True):
-                msgs.append((m, hard))
-
             if not bl:
                 say("没有 Transport B/L, 正面是白页")
+            elif not nbl:
+                say(f"Transport B/L 读不了(0 字节或文件损坏), 正面是白页: {bl.name}")
             elif nbl != 1:
                 say(f"B/L 有 {nbl} 页, 正反面可能错位")
             if not wb:
@@ -1343,7 +1368,16 @@ def main():
             name = "PRINT.pdf" if len(batches) == 1 else f"PRINT_{bi:02d}.pdf"
             with open(writable_path(out_dir / name), "wb") as fh:
                 writer.write(fh)
-            print(f"  {name}: {len(writer.pages)} 页 = {len(writer.pages)//2} 张纸")
+            np_ = len(writer.pages)
+            print(f"  {name}: {np_} 页 = {np_ // 2} 张纸")
+            # 出厂自检: 两叠纸要能对着订, 张数必须跟票数严格吻合。
+            # 这里不信任上面的计数, 拿实际写进 PDF 的页数反过来核一遍。
+            want = sum(1 for r in rows if r["批次"] == bi and r["第几张纸"] != "")
+            if np_ != want * 2:
+                print(f"  !! 张数不对: 应该 {want} 张({want * 2} 页), 实际 {np_} 页")
+                print(f"  !! 别拿这一叠去跟第二叠对订, 先把上面的报错解决掉")
+            elif np_ % 2:
+                print(f"  !! 页数是奇数, 双面打印会错位")
 
     report_path = write_s1_report(out_dir, rows, problems, man_lines)
 

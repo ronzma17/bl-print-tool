@@ -365,6 +365,27 @@ def core_mbl(v: str) -> str:
     return m.group(0) if m else v
 
 
+
+def add_pages(writer, path: Path, pick) -> bool:
+    """把 path 的第 pick 页(从 1 数)搬进 writer, 成功返回 True。
+
+       出错就把这次搬进去的退掉、补一张白页, 返回 False —— 这一票的内容没了,
+       但【纸张数照样对得上】, 后面的票不会跟着错位。
+    """
+    before = len(writer.pages)
+    try:
+        r = PdfReader(str(path))
+        for i in pick:
+            writer.add_page(r.pages[i - 1])
+        return True
+    except Exception as e:
+        print(f"  ! 搬页子出错 {path.name}: {e}")
+        while len(writer.pages) > before:
+            del writer.pages[-1]
+        writer.add_blank_page(width=612, height=792)
+        return False
+
+
 def load_order(report: Path):
     """从第一叠的报告里读出 (HBL, MBL) 顺序。第一叠现在出的是 xlsx, 老的 csv 也还认。"""
     order = []
@@ -483,14 +504,19 @@ def main():
         _, npages, hbl_in_pdf, cons, mode, dest, eta = meta[core]
         take = [x for x in TAKE_PAGES if x <= npages]
         if writer is not None and not dup:
-            r = PdfReader(str(p))
-            for x in take:
-                writer.add_page(r.pages[x - 1])
+            # 这里必须保证「一票一页」。take 为空(文件读不了、0 页)时
+            # 原来是一页都不加, 那这一票之后的全都会错位一张纸 ——
+            # 对不齐比内容缺了严重得多, 所以宁可出白页。
+            before = len(writer.pages)
+            if take:
+                add_pages(writer, p, take)
+            if len(writer.pages) == before:
+                writer.add_blank_page(width=612, height=792)
         note = ""
         if hbl and hbl_in_pdf and hbl != hbl_in_pdf:
             note = f"HBL 对不上 (PDF 里是 {hbl_in_pdf})"
         elif not take:
-            note = "这个 PDF 是空的"
+            note = "这个 PDF 读不了/是空的, 已插白页占位"
         if not cons:
             note = (note + " / " if note else "") + "柜信息读不出来"
         if dup:
@@ -536,7 +562,16 @@ def main():
     if writer is not None:
         with open(writable_path(out_dir / OUT_NAME), "wb") as fh:
             writer.write(fh)
-        print(f"  {OUT_NAME}: {len(writer.pages)} 页 = {len(writer.pages)} 张纸 (单面打印)")
+        np_ = len(writer.pages)
+        print(f"  {OUT_NAME}: {np_} 页 = {np_} 张纸 (单面打印)")
+        # 出厂自检: 这一叠要跟第一叠一张一张对着订, 张数必须一模一样。
+        # 每一票(不跟人共用纸的)出一页, 缺件也出白页, 所以两边应该严格相等。
+        want = sum(1 for r in rows if r["第几张纸"] != "")
+        if np_ != want:
+            print(f"  !! 张数不对: 应该 {want} 张, 实际 {np_} 页")
+            print(f"  !! 这一叠跟第一叠对不齐, 别往下订")
+        else:
+            print(f"  张数自检通过: {np_} 张, 跟第一叠的 {want} 票一一对应")
 
         stale = out_dir / EXTRA_NAME
         if not extras and stale.exists():
