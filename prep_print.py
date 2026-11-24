@@ -135,6 +135,11 @@ def group_rows(sel, ytol=4):
     return out
 
 
+# ON BOARD 日期。只认 2026-11-19 这种写法 —— 认不出来宁可留空让人填,
+# 也不要把 11/19 猜成几月几号。ETD 猜错了整票的时间线就乱了。
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
 def parse_hbl(path: Path):
     """从 Transport B/L 抠出 shipper / consignee / notify / marks / description。
 
@@ -187,15 +192,47 @@ def parse_hbl(path: Path):
     #     y=404.0 x=212.2 SHANGHAI          <- 这是装货港, 在右边, 不要
     # 所以取 x<200、在 notify 块下方的头两行就行。
     below = max((y for y, _, _ in bl[2]), default=0) if len(bl) > 2 else 0
+    left_right = [(y, x, t) for y, x, t in it if y > below + 1]
     tail = sorted((y, x, t) for y, x, t in left if x < 200 and y > below + 1)
     res["vessel"] = tail[0][2] if tail else ""
     # 航次是个代码, 有字母也有数字。不符合就不填 —— 宁可空着也别填错
     res["voyage"] = ""
-    if len(tail) > 1:
-        cand = tail[1][2].strip()
+    rest = list(tail[1:])
+    if rest:
+        cand = rest[0][2].strip()
         if (re.fullmatch(r"[A-Z0-9/.-]{3,14}", cand)
                 and any(c.isdigit() for c in cand)):
             res["voyage"] = cand
+            rest = rest[1:]          # 认出来是航次才往下挪一格
+
+    # 再往下一行是【卸货港】(Port of Discharge), 右边同一行是【交货地】。
+    # Ramp(转铁路)的票这两个不一样: 洛杉矶卸船, 纽约交货。
+    # 舱单上的「目的港」给的是【交货地】, 所以卸货港只能从 B/L 上拿。
+    #     y=438.4 x= 33.6  LOS ANGELES, CALIFORNIA   <- 卸货港
+    #     y=438.4 x=205.1  NEW YORK, NEW YORK        <- 交货地
+    res["卸货港"] = res["交货地"] = ""
+    for y, x, t in rest:
+        if len(t) < 3 or not any(c.isalpha() for c in t):
+            continue
+        res["卸货港"] = t.strip()
+        mate = [(xx, tt) for yy, xx, tt in left_right
+                if abs(yy - y) < 7 and xx > 200 and any(c.isalpha() for c in tt)]
+        if mate:
+            res["交货地"] = sorted(mate)[0][1].strip()
+        break
+
+    # ETD: 单子右上角盖的 ON BOARD 戳, 日期在标签【下面】一行。
+    #     y=615.4 x=621.6 'ON BOARD'
+    #     y=646.7 x=633.6 '2026-11-19'
+    # 每票不一样(同一条船也可能差一两天), 所以必须逐票抠, 不能写死。
+    res["ETD"] = ""
+    labels = [(y, x) for y, x, t in it if "ON BOARD" in t.upper()]
+    if labels:
+        ly, lx = labels[0]
+        cands = sorted((y, x, t) for y, x, t in it
+                       if y > ly and abs(x - lx) < 80 and DATE_RE.fullmatch(t.strip()))
+        if cands:
+            res["ETD"] = cands[0][2].strip()
 
     cy = [y for y, x, t in it if y > 460 and CONTAINER_PATTERN.fullmatch(t)]
     y1 = min(cy) - 6 if cy else 680
@@ -663,7 +700,9 @@ S1_FIELDS = [
     ("航次",     "航次"),
     ("运输方式", "运输方式"),
     ("起始港",   "起始港"),
+    ("卸货港",   "卸货港"),
     ("目的地",   "目的地"),
+    ("ETD",      "ETD"),
     ("ETA",      "ETA"),
     ("状态",     "状态"),
     ("第几张纸", "第几张纸"),
@@ -1412,6 +1451,21 @@ def main():
             if dest:
                 mode = "Ramp" if dest != main_pod else "Port"
 
+            # 交叉校验。Ramp 有两个独立的判法:
+            #   舱单: 目的港 跟大多数票不一样
+            #   B/L : 交货地 跟卸货港不一样(洛杉矶卸船, 纽约交货)
+            # 两边都对才放心。不一致就说出来 —— Ramp 判错的后果是
+            # 整票的 Service Term 和交货地都填错, 单子打出来是废的。
+            bl_pod  = (party.get("卸货港") or "").upper()
+            bl_dest = (party.get("交货地") or "").upper()
+            if bl_pod and bl_dest:
+                bl_mode = "Ramp" if bl_pod != bl_dest else "Port"
+                if mode and bl_mode != mode:
+                    say(f"舱单说是 {mode}, 但 B/L 上写着 "
+                        f"卸货港={bl_pod} 交货地={bl_dest}", True)
+                elif not mode:
+                    mode = bl_mode      # 舱单没给目的港时, 用 B/L 的
+
             note = " / ".join(m for m, _ in msgs)
             issue = any(hard for _, hard in msgs)
 
@@ -1438,7 +1492,14 @@ def main():
                 "材积": cargo.get("材积", ""),
                 "船名": party.get("vessel", "") or man_vessel,
                 "航次": party.get("voyage", "") or man_voyage,
-                "运输方式": mode, "起始港": pol, "目的地": dest, "ETA": "",
+                "运输方式": mode, "起始港": pol,
+                # 卸货港只有 B/L 上有。舱单的「目的港」给的是交货地 ——
+                # Ramp 票两者不同(洛杉矶卸船, 纽约交货), 混用会把
+                # port_of_discharge 填成纽约, 而船根本不去纽约。
+                "卸货港": party.get("卸货港", ""),
+                "目的地": dest or party.get("交货地", ""),
+                "ETD": party.get("ETD", ""),
+                "ETA": "",
                 "PolOdd": pol_odd,
                 "状态": note or "正常",
                 "Issue": issue,
