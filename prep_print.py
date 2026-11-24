@@ -22,6 +22,7 @@
 import argparse
 import csv
 import re
+import statistics
 import shutil
 import sys
 import zipfile
@@ -152,9 +153,22 @@ def parse_hbl(path: Path):
         return {}
 
     left = [z for z in it if z[1] < 300 and z[0] < 460]
+
+    # 多大的空档才算"换了一块"? 原来写死 25, 结果踩了坑:
+    # 有的单子当事人之间只隔 24.2, 差 0.8 没切开, Consignee 就把 Notify
+    # 整个吞了, 后面全部错位一格 —— Notify 那栏会填进船名和港口。
+    #
+    # 所以不写死, 拿【这张单子自己的行距】当基准。同一块里的行距是固定的
+    # (上面那张是 13.6), 块与块之间总会明显更大。取中位数当行距,
+    # 超过 1.5 倍就算空档, 字号大小不同的单子都能自适应。
+    gaps = [left[i][0] - left[i - 1][0] for i in range(1, len(left))]
+    gaps = [g for g in gaps if g > 0]
+    base = statistics.median(gaps) if gaps else 13.6
+    limit = max(base * 1.5, base + 4)
+
     bl, cur, last = [], [], None
     for y, x, t in left:
-        if last is not None and y - last > 25:
+        if last is not None and y - last > limit:
             bl.append(cur)
             cur = []
         cur.append((y, x, t))
@@ -165,6 +179,23 @@ def parse_hbl(path: Path):
     res = {"_blocks": len(bl)}
     for i, k in enumerate(("shipper", "consignee", "notify")):
         res[k] = "\n".join(t for _, _, t in bl[i]) if i < len(bl) else ""
+
+    # 三个当事人下面就是船名/航次那一块(单子上写着 Ocean Vessel)。
+    # 版面是这样的, 船名在上, 航次紧贴下面一行, 都靠左:
+    #     y=399.8 x=31.7  CMA CGM WHITE SHARK
+    #     y=413.4 x=31.7  EXX0K0E
+    #     y=404.0 x=212.2 SHANGHAI          <- 这是装货港, 在右边, 不要
+    # 所以取 x<200、在 notify 块下方的头两行就行。
+    below = max((y for y, _, _ in bl[2]), default=0) if len(bl) > 2 else 0
+    tail = sorted((y, x, t) for y, x, t in left if x < 200 and y > below + 1)
+    res["vessel"] = tail[0][2] if tail else ""
+    # 航次是个代码, 有字母也有数字。不符合就不填 —— 宁可空着也别填错
+    res["voyage"] = ""
+    if len(tail) > 1:
+        cand = tail[1][2].strip()
+        if (re.fullmatch(r"[A-Z0-9/.-]{3,14}", cand)
+                and any(c.isdigit() for c in cand)):
+            res["voyage"] = cand
 
     cy = [y for y, x, t in it if y > 460 and CONTAINER_PATTERN.fullmatch(t)]
     y1 = min(cy) - 6 if cy else 680
@@ -457,6 +488,21 @@ def parse_waybill(path: Path):
     }
 
 
+def vessel_from_filename(name: str):
+    """舱单文件名一般长这样: 'CMA CGM WHITE SHARK EXX0K0E BKG LIST.xls'
+    B/L 抠不出来时拿它兜底。认不出来就返回两个空串, 不瞎猜。"""
+    t = re.sub(r"\.(xls|xlsx|xlsm|csv)$", "", name or "", flags=re.I)
+    t = re.sub(r"\b(BKG|BOOKING)?\s*LIST\b.*$", "", t, flags=re.I)
+    t = re.sub(r"[_\-]+", " ", t).strip().upper()
+    if not t:
+        return "", ""
+    parts = t.split()
+    if len(parts) > 1 and re.fullmatch(r"[A-Z0-9/.-]{3,14}", parts[-1]) \
+            and any(c.isdigit() for c in parts[-1]):
+        return " ".join(parts[:-1]), parts[-1]
+    return t, ""
+
+
 def manifest_rows(path: Path):
     """读舱单, 返回 {MBL: {...}}。不认列名(船公司表头会变), 靠内容判断每一列是什么。"""
     rows = []
@@ -485,6 +531,28 @@ def manifest_rows(path: Path):
         return {}
 
     SIZE = re.compile(r"(\d+)\s*[xX]\s*(\d{2}[A-Z]{2})")
+
+    # 舱单第一行是表头: 托单编号 始发港 目的港 主提单号 箱型箱量 备注 文件包
+    # 认表头拿列号, 别去猜哪一格长得像港口 ——
+    # 以前是挑「全大写 + 全字母 + 超过 3 个字」的格子当港口, 两头都会翻车:
+    #   LOS ANGELES, CALIFORNIA  带逗号, isalpha() 就是 False, 整列读不到
+    #   LA清关                   中文字符在 Python 眼里既算大写又算字母, 反被当成港口
+    # 结果目的港全错, 转铁路的票一张都标不出来。
+    head = {}
+    for r in rows[:5]:                       # 表头不一定在第一行, 前几行里找
+        hit = {}
+        for c, v in enumerate(r):
+            t = v.strip()
+            if t in ("始发港", "目的港", "备注", "文件包", "托单编号", "主提单号", "箱型箱量"):
+                hit[t] = c
+        if "目的港" in hit or "主提单号" in hit:
+            head = hit
+            break
+
+    def cell(r, name):
+        c = head.get(name, -1)
+        return r[c].strip() if 0 <= c < len(r) else ""
+
     out = {}
     for r in rows:
         mbl = next((v.upper() for v in r
@@ -493,15 +561,25 @@ def manifest_rows(path: Path):
             continue
         hbl = next((v.upper() for v in r if HBL_PATTERN.search(v.upper())), "")
         sz  = next((SIZE.search(v) for v in r if SIZE.search(v)), None)
-        pods = [v for v in r if v.isupper() and v.replace(" ", "").isalpha() and len(v) > 3]
+        if head:
+            pol, pod = cell(r, "始发港"), cell(r, "目的港")
+            memo, pack = cell(r, "备注"), cell(r, "文件包")
+        else:
+            # 没表头的舱单(别家格式 / 导出成 csv 丢了表头)才退回老办法
+            pods = [v for v in r if v.isupper() and len(v) > 3
+                    and v.replace(" ", "").replace(",", "").replace(".", "").isalpha()]
+            pol = pods[0] if len(pods) > 0 else ""
+            pod = pods[1] if len(pods) > 1 else ""
+            memo = next((v for v in r if any(ch > "\u4e00" for ch in v)), "")
+            pack = next((v for v in r if v.upper().startswith("PART")), "")
         out.setdefault(mbl, []).append({
             "HBL舱单": hbl,
             "柜数舱单": int(sz.group(1)) if sz else "",
             "柜型舱单": sz.group(2) if sz else "",
-            "始发港": pods[0] if len(pods) > 0 else "",
-            "目的港": pods[1] if len(pods) > 1 else "",
-            "备注": next((v for v in r if any(ch > "\u4e00" for ch in v)), ""),
-            "文件包": next((v for v in r if v.upper().startswith("PART")), ""),
+            "始发港": pol,
+            "目的港": pod,
+            "备注": memo,
+            "文件包": pack,
         })
     return out
 
@@ -581,6 +659,8 @@ S1_FIELDS = [
     ("材积",     "材积"),
     ("Marks and Numbers",   "Marks"),
     ("Description of Goods","Description"),
+    ("船名",     "船名"),
+    ("航次",     "航次"),
     ("运输方式", "运输方式"),
     ("起始港",   "起始港"),
     ("目的地",   "目的地"),
@@ -630,7 +710,7 @@ def write_s1_report(out_dir, rows, problems, man_lines):
         return path
 
     ORANGE = PatternFill("solid", fgColor="FCE4D6")
-    PURPLE = PatternFill("solid", fgColor="E4DFEC")   # Notify 里没有邮箱
+    GREEN  = PatternFill("solid", fgColor="D5EFD5")   # Notify 里没有邮箱
     YELLOW = PatternFill("solid", fgColor="FFF2CC")   # Notify 公司名跟 Consignee 不同
     HEAD   = PatternFill("solid", fgColor="DDEBF7")
     RED    = Font(color="C00000", bold=True)   # Ramp
@@ -674,7 +754,7 @@ def write_s1_report(out_dir, rows, problems, man_lines):
         if r.get("NotifyAddrDiff"):
             ws.cell(i, notify_col).fill = YELLOW
         elif not r.get("NotifySameAs") and "@" not in str(r.get("Notify", "")):
-            ws.cell(i, notify_col).fill = PURPLE
+            ws.cell(i, notify_col).fill = GREEN
         sz = str(r.get("柜型", ""))
         if sz and any(x.strip().upper() != "40HC" for x in sz.split(",")):
             ws.cell(i, size_col).fill = ORANGE
@@ -718,7 +798,7 @@ def write_s1_report(out_dir, rows, problems, man_lines):
         print(f"  Notify 跟 Consignee 不一致 {ndiff} 票 -> 不一致的那格标黄")
     print(f"  Ramp(转铁路) {ramp} 票 -> 整行红字")
     if nomail:
-        print(f"  Notify 里没有邮箱 {nomail} 票 -> 该格标紫")
+        print(f"  Notify 里没有邮箱 {nomail} 票 -> 该格标绿")
     print(f"  非 40HC 柜型 {odd} 票 -> 柜型格标橙")
 
     path = writable_path(out_dir / "_报告.xlsx")
@@ -1128,6 +1208,7 @@ def main():
 
     # ---- 跟船公司舱单核对 ----
     man_lines, man_info = [], {}
+    man_vessel = man_voyage = ""
     mp = Path(args.manifest) if args.manifest else None
     if mp is None:                                   # 没指定就在输入文件夹里自己找
         found = sorted(f for f in src.iterdir()
@@ -1136,6 +1217,7 @@ def main():
             mp = found[0]
             print(f"发现舱单: {mp.name}\n")
     if mp:
+        man_vessel, man_voyage = vessel_from_filename(mp.name)
         if not mp.exists():
             print(f"!! 找不到舱单: {mp}\n")
         else:
@@ -1354,6 +1436,8 @@ def main():
                 "件数": cargo.get("件数", ""),
                 "重量": cargo.get("重量", ""),
                 "材积": cargo.get("材积", ""),
+                "船名": party.get("vessel", "") or man_vessel,
+                "航次": party.get("voyage", "") or man_voyage,
                 "运输方式": mode, "起始港": pol, "目的地": dest, "ETA": "",
                 "PolOdd": pol_odd,
                 "状态": note or "正常",
